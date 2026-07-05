@@ -8,6 +8,7 @@
 
 pub mod commands;
 pub mod detect;
+pub mod pipeline;
 pub mod worktree;
 
 use std::io::Write;

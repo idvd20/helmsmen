@@ -50,6 +50,14 @@ pub struct LaunchContext<'a> {
     pub workspace_root: &'a str,
     /// The Workspace's `HELMSMEN_*` env set.
     pub env: &'a BTreeMap<String, String>,
+    /// Harness-specific model from the Profile (task #8); empty = the
+    /// Harness default. Ignored by Harnesses without the `model_select`
+    /// Cap.
+    pub model: &'a str,
+    /// Opening prompt for the first Agent Session — the Profile's prompt
+    /// snippet with the Brief composed in (task #8). Empty = start
+    /// without a prompt (M1 behavior, and every later Session).
+    pub opening_prompt: &'a str,
 }
 
 /// The command a Runtime should spawn: argv only, never a shell string, so

@@ -29,12 +29,30 @@ impl Harness for ClaudeCode {
         CLAUDE_CODE_CAPS
     }
 
-    /// Interactive `claude`, no args at M1. Model, MCP set, and the
-    /// opening prompt from the Brief compose onto this plan at M2 (#8).
-    fn launch_plan(&self, _ctx: &LaunchContext) -> LaunchPlan {
+    /// Interactive `claude`. The Profile's model and the opening prompt
+    /// (snippet + Brief) compose onto the plan as argv (task #8); the MCP
+    /// set arrives at M6. Bare `claude` when both are empty (M1 behavior,
+    /// and every Session after the first).
+    fn launch_plan(&self, ctx: &LaunchContext) -> LaunchPlan {
+        let mut args = Vec::new();
+        if !ctx.model.is_empty() {
+            // `--model=x` as ONE argv element: a hostile model string can
+            // never be re-parsed as a separate flag.
+            args.push(format!("--model={}", ctx.model));
+        }
+        if !ctx.opening_prompt.is_empty() {
+            // Positional prompt starts the interactive REPL with it. A
+            // leading `-` would parse as a flag; a leading space keeps it
+            // data without changing the prompt's meaning.
+            if ctx.opening_prompt.starts_with('-') {
+                args.push(format!(" {}", ctx.opening_prompt));
+            } else {
+                args.push(ctx.opening_prompt.to_string());
+            }
+        }
         LaunchPlan {
             program: "claude".to_string(),
-            args: Vec::new(),
+            args,
         }
     }
 
@@ -80,26 +98,65 @@ mod tests {
         assert!(model_select);
     }
 
-    #[test]
-    fn launch_plan_is_interactive_claude_as_argv() {
-        let env = ctx_env();
-        let ctx = LaunchContext {
+    fn ctx<'a>(
+        env: &'a BTreeMap<String, String>,
+        model: &'a str,
+        opening_prompt: &'a str,
+    ) -> LaunchContext<'a> {
+        LaunchContext {
             workspace_root: "/tmp/wt/fix-1",
-            env: &env,
-        };
-        let plan = ClaudeCode.launch_plan(&ctx);
-        assert_eq!(plan.program, "claude");
-        assert!(plan.args.is_empty(), "interactive at M1: no args");
+            env,
+            model,
+            opening_prompt,
+        }
     }
 
     #[test]
-    fn config_injection_seam_exists_and_is_empty_at_m1() {
+    fn launch_plan_is_interactive_claude_as_argv() {
         let env = ctx_env();
-        let ctx = LaunchContext {
-            workspace_root: "/tmp/wt/fix-1",
-            env: &env,
-        };
-        assert!(ClaudeCode.config_injection(&ctx).is_empty());
+        let plan = ClaudeCode.launch_plan(&ctx(&env, "", ""));
+        assert_eq!(plan.program, "claude");
+        assert!(plan.args.is_empty(), "bare interactive claude: no args");
+    }
+
+    // --- task #8: model + opening prompt compose onto the plan ---
+
+    #[test]
+    fn launch_plan_composes_model_and_opening_prompt() {
+        let env = ctx_env();
+        let plan = ClaudeCode.launch_plan(&ctx(&env, "claude-sonnet-4-5", "/tdd fix login"));
+        assert_eq!(plan.program, "claude");
+        assert_eq!(
+            plan.args,
+            vec!["--model=claude-sonnet-4-5".to_string(), "/tdd fix login".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_is_a_single_argv_element_never_a_separate_flag() {
+        let env = ctx_env();
+        // A hostile model string must stay the value of --model=.
+        let plan = ClaudeCode.launch_plan(&ctx(&env, "--dangerously-skip-permissions", ""));
+        assert_eq!(plan.args, vec!["--model=--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn a_prompt_starting_with_a_dash_is_kept_as_data() {
+        let env = ctx_env();
+        let plan = ClaudeCode.launch_plan(&ctx(&env, "", "--help me fix this"));
+        assert_eq!(plan.args, vec![" --help me fix this"]);
+        assert!(
+            !plan.args.iter().any(|a| a.starts_with('-')),
+            "no workspace-derived arg may parse as a flag"
+        );
+    }
+
+    #[test]
+    fn config_injection_seam_exists_and_is_empty_at_m2() {
+        let env = ctx_env();
+        assert!(ClaudeCode
+            .config_injection(&ctx(&env, "", "/tdd x"))
+            .is_empty());
     }
 
     #[test]

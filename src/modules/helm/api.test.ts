@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   type ChannelFactory,
   createHelmApi,
+  deriveWorkspaceStatus,
+  HELM_STATUS_ALIAS,
   type HelmAgentSession,
   type HelmCutWorkspace,
   type HelmHarness,
@@ -9,6 +11,7 @@ import {
   type HelmProject,
   type HelmProjectDetection,
   type HelmProjectSettings,
+  type HelmWorkspace,
   type InvokeFn,
 } from "./api";
 
@@ -50,6 +53,7 @@ const cutResult: HelmCutWorkspace = {
     branch: "helm/fix-login",
     worktreePath: "/home/dev/.helmsmen/worktrees/demo/fix-login-1",
     slot: 1,
+    cut: { phase: "complete", firstSessionId: "" },
   },
   env: {
     HELMSMEN_SLOT: "1",
@@ -150,6 +154,29 @@ describe("createHelmApi", () => {
     ]);
     expect(cut.env.HELMSMEN_SLOT).toBe(String(cut.workspace.slot));
     expect(cut.env.HELMSMEN_WORKSPACE).toBe(cut.workspace.worktreePath);
+  });
+
+  // Locks the frontend seam of task #8 (M2: the full cut pipeline,
+  // ambient): one command, called with the whole cut form; the backend
+  // returns the Cutting Workspace at enqueue and everything slow runs in
+  // the background. Step order, parking, and logs are covered by the
+  // Rust tests in src-tauri/src/modules/registry/pipeline.rs.
+  it("cutPipeline invokes helm_cut_pipeline and returns the Cutting workspace", async () => {
+    const cutting: HelmWorkspace = {
+      ...cutResult.workspace,
+      cut: { phase: "cutting" },
+    };
+    const { invoke, calls } = fakeInvoke({ helm_cut_pipeline: cutting });
+    const api = createHelmApi(invoke);
+    const input = {
+      projectId: "prj-1",
+      slug: "fix-login",
+      profileId: "prj-1:feature",
+      brief: "fix the login page",
+      fetch: true,
+    };
+    await expect(api.cutPipeline(input)).resolves.toEqual(cutting);
+    expect(calls).toEqual([["helm_cut_pipeline", { input }]]);
   });
 
   it("removeWorkspace invokes helm_remove_workspace with the id", async () => {
@@ -427,5 +454,40 @@ describe("createHelmApi agent sessions", () => {
     const api = createHelmApi(invoke);
     await expect(api.listHarnesses()).resolves.toEqual([harness]);
     expect(calls).toEqual([["helm_list_harnesses", undefined]]);
+  });
+});
+
+// Mirrors the pure-core derivation (core::cut::derive_status) for list
+// rendering: a failed cut parks the Workspace as blocked — display alias
+// "Needs you" — with the failing step's log attached; a status is
+// derived, never stored.
+describe("deriveWorkspaceStatus", () => {
+  const base = cutResult.workspace;
+
+  it("parks a failed cut as blocked, alias 'Needs you'", () => {
+    const parked: HelmWorkspace = {
+      ...base,
+      cut: {
+        phase: "failed",
+        step: "setupScript",
+        log: "pnpm ERR! exit 7",
+      },
+    };
+    const status = deriveWorkspaceStatus(parked);
+    expect(status).toBe("blocked");
+    expect(HELM_STATUS_ALIAS[status]).toBe("Needs you");
+  });
+
+  it("shows a running pipeline as working and a finished cut as idle", () => {
+    expect(deriveWorkspaceStatus({ ...base, cut: { phase: "cutting" } })).toBe(
+      "working",
+    );
+    expect(
+      deriveWorkspaceStatus({
+        ...base,
+        cut: { phase: "complete", firstSessionId: "rt-1" },
+      }),
+    ).toBe("idle");
+    expect(HELM_STATUS_ALIAS.done).toBe("To review");
   });
 });
