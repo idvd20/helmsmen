@@ -1,32 +1,73 @@
-// Helmsmen dev console — the M1 surface for adding a Project and cutting
-// a Workspace.
+// Helmsmen dev console — the M1 surface: add a Project, cut a Workspace,
+// spawn `claude`, stream + type.
 //
-// Exposes `window.helmsmen` in the main webview so both flows run
-// end-to-end from the devtools console:
+// Exposes `window.helmsmen` in the main webview so the whole M1 scripted
+// demo runs from the devtools console:
 //
-//   await helmsmen.detectProject("/path/to/clone")   // prefill, editable
-//   await helmsmen.addProjectFromPath("/path/to/clone", {
-//     baseBranch: "develop",                          // optional edits
-//   })
-//   await helmsmen.listProjects()
+//   const p = await helmsmen.addProjectFromPath("/path/to/clone")
+//   const { workspace } = await helmsmen.cutWorkspace(p.id, "demo")
 //
-//   const { workspace, env } = await helmsmen.cutWorkspace("prj-…", "fix-login")
-//   await helmsmen.listWorkspaces()
-//   await helmsmen.workspaceEnv(workspace.id)         // HELMSMEN_* set
-//   await helmsmen.removeWorkspace(workspace.id)      // frees the Slot
+//   const s = await helmsmen.spawnAgentView(workspace.id)   // stream view
+//   await helmsmen.writeAgent(s, "hello")                   // type into it
+//   await helmsmen.writeAgent(s, "\r")
+//   await helmsmen.agentStatus(s)
+//   await helmsmen.killAgent(s)
+//
+//   await helmsmen.listHarnesses()                          // Caps, from code
+//   await helmsmen.removeWorkspace(workspace.id)
 //
 // Thin by design: every call goes straight to the Tauri commands, which
-// validate at the boundary and in the pure core.
+// validate at the boundary and in the pure core. The frontend never
+// spawns processes, runs git, or touches repo files; session output is
+// hostile bytes and only ever rendered as text (see streamView.ts).
 
-import { invoke } from "@tauri-apps/api/core";
-import { createHelmApi, type HelmApi } from "./api";
+import { Channel, invoke } from "@tauri-apps/api/core";
+import {
+  type ChannelFactory,
+  createHelmApi,
+  type HelmAgentSession,
+  type SpawnAgentOptions,
+} from "./api";
+import { openStreamView } from "./streamView";
+
+const makeChannel: ChannelFactory = <T>(onMessage: (message: T) => void) => {
+  const channel = new Channel<T>();
+  channel.onmessage = onMessage;
+  return channel;
+};
+
+function createDevConsole() {
+  const api = createHelmApi(invoke, makeChannel);
+
+  /** Spawn with a visible stream view attached — the one-call demo path. */
+  const spawnAgentView = async (
+    workspaceId: string,
+    opts: SpawnAgentOptions = {},
+  ): Promise<HelmAgentSession> => {
+    const view = openStreamView(`agent @ ${workspaceId}`);
+    try {
+      return await api.spawnAgent(workspaceId, {
+        onData: (bytes) => view.write(bytes),
+        onExit: (code) => view.exit(code),
+        ...opts,
+      });
+    } catch (error) {
+      view.close();
+      throw error;
+    }
+  };
+
+  return { ...api, spawnAgentView };
+}
+
+type HelmDevConsole = ReturnType<typeof createDevConsole>;
 
 declare global {
   interface Window {
-    helmsmen?: HelmApi;
+    helmsmen?: HelmDevConsole;
   }
 }
 
 export function installHelmDevConsole(): void {
-  window.helmsmen = createHelmApi(invoke);
+  window.helmsmen = createDevConsole();
 }

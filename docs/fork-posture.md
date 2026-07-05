@@ -52,10 +52,10 @@ The only Terax files Helmsmen may edit. Grow this list deliberately; anything
 not listed is upstream's territory.
 
 - `src-tauri/src/modules/mod.rs` — module declarations for the new Helmsmen
-  backend modules (`core`, `registry`; later `runtime`, `harness`, `hooks`).
+  backend modules (`core`, `registry`, `runtime`, `harness`; later `hooks`).
 - `src-tauri/src/lib.rs` — registration only: manage
-  `registry::RegistryState` in `.setup()` and list the `helm_*` commands in
-  `invoke_handler` (tasks #4, #5).
+  `registry::RegistryState` in `.setup()`, manage `runtime::RuntimeState`,
+  and list the `helm_*` commands in `invoke_handler` (tasks #4, #5, #6).
 - `src/main.tsx` — install the Helm dev console (`window.helmsmen`,
   task #4); later the Helm surface registration.
 - _Still expected during M1+ (tracked in issue #2):_ settings schema (Terax
@@ -65,6 +65,11 @@ Workspace-root authorization for the cut pipeline (task #5) needed **no**
 shared-file edit: `helm_cut_workspace` authorizes each cut worktree path via
 the existing public API `modules::workspace::WorkspaceRegistry::authorize`
 (`workspace.rs` itself stays untouched).
+
+The runtime/harness layer (task #6) likewise stays out of upstream modules:
+`modules::runtime::local_pty` builds on the `portable-pty` crate directly
+(Terax's `modules::pty` is untouched), and Agent Session spawns re-use
+`WorkspaceRegistry::authorize` for the cut worktree only.
 
 ## Local, non-committed state
 

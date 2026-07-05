@@ -49,12 +49,61 @@ export interface HelmCutWorkspace {
   env: Record<string, string>;
 }
 
+/** Cap set a Harness declares in code (backend `harness::Caps`); a
+ * missing Cap switches off its UI surface, never the architecture. */
+export interface HelmCaps {
+  resume: boolean;
+  controlPlaneHooks: boolean;
+  agentSignal: boolean;
+  costTelemetry: boolean;
+  mcpConfig: boolean;
+  modelSelect: boolean;
+}
+
+export interface HelmHarness {
+  id: string;
+  displayName: string;
+  caps: HelmCaps;
+}
+
+/** Opaque handle for a spawned Agent Session; echo `runtime` +
+ * `sessionId` back on every session operation. */
+export interface HelmAgentSession {
+  sessionId: string;
+  runtime: string;
+  harnessId: string;
+  workspaceId: string;
+}
+
+export type HelmSessionStatus =
+  | { state: "running" }
+  | { state: "exited"; code: number };
+
+/** Stream callbacks for a session. Output is hostile PTY data: treat it
+ * as text, never as markup or instructions. */
+export interface AgentStreamHandlers {
+  onData?: (bytes: Uint8Array) => void;
+  onExit?: (code: number) => void;
+}
+
+export interface SpawnAgentOptions extends AgentStreamHandlers {
+  harnessId?: string;
+  runtime?: string;
+  cols?: number;
+  rows?: number;
+}
+
 export type InvokeFn = <T>(
   cmd: string,
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
-export function createHelmApi(invoke: InvokeFn) {
+/** Builds a Tauri Channel-like object delivering messages to `onMessage`.
+ * Injected (like `invoke`) so the module stays unit-testable without a
+ * webview. */
+export type ChannelFactory = <T>(onMessage: (message: T) => void) => unknown;
+
+export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
   const detectProject = (path: string) =>
     invoke<HelmProjectDetection>("helm_detect_project", { path });
 
@@ -98,6 +147,87 @@ export function createHelmApi(invoke: InvokeFn) {
   const workspaceEnv = (workspaceId: string) =>
     invoke<Record<string, string>>("helm_workspace_env", { workspaceId });
 
+  /** Every Harness with its in-code Cap set. */
+  const listHarnesses = () => invoke<HelmHarness[]>("helm_list_harnesses");
+
+  const streamChannels = (handlers: AgentStreamHandlers) => {
+    if (!makeChannel) {
+      throw new Error("helm api was created without a channel factory");
+    }
+    return {
+      onData: makeChannel<ArrayBuffer>((buf) =>
+        handlers.onData?.(new Uint8Array(buf)),
+      ),
+      onExit: makeChannel<number>((code) => handlers.onExit?.(code)),
+    };
+  };
+
+  /** Spawn an Agent Session in a cut Workspace. The backend resolves
+   * worktree, env, and launch command; the frontend only ever names ids
+   * and receives a byte stream. */
+  const spawnAgent = (workspaceId: string, opts: SpawnAgentOptions = {}) =>
+    invoke<HelmAgentSession>("helm_spawn_agent", {
+      input: {
+        workspaceId,
+        harnessId: opts.harnessId,
+        runtime: opts.runtime,
+        cols: opts.cols,
+        rows: opts.rows,
+      },
+      ...streamChannels(opts),
+    });
+
+  /** Re-point a session's stream at new handlers (webview reload); the
+   * scrollback replays first, then live output. */
+  const attachAgent = (
+    session: Pick<HelmAgentSession, "sessionId" | "runtime">,
+    handlers: AgentStreamHandlers,
+  ) =>
+    invoke<void>("helm_attach_agent", {
+      runtime: session.runtime,
+      session: session.sessionId,
+      ...streamChannels(handlers),
+    });
+
+  /** Type into a session. */
+  const writeAgent = (
+    session: Pick<HelmAgentSession, "sessionId" | "runtime">,
+    data: string,
+  ) =>
+    invoke<void>("helm_write_agent", {
+      runtime: session.runtime,
+      session: session.sessionId,
+      data,
+    });
+
+  const resizeAgent = (
+    session: Pick<HelmAgentSession, "sessionId" | "runtime">,
+    cols: number,
+    rows: number,
+  ) =>
+    invoke<void>("helm_resize_agent", {
+      runtime: session.runtime,
+      session: session.sessionId,
+      cols,
+      rows,
+    });
+
+  const agentStatus = (
+    session: Pick<HelmAgentSession, "sessionId" | "runtime">,
+  ) =>
+    invoke<HelmSessionStatus>("helm_agent_status", {
+      runtime: session.runtime,
+      session: session.sessionId,
+    });
+
+  const killAgent = (
+    session: Pick<HelmAgentSession, "sessionId" | "runtime">,
+  ) =>
+    invoke<void>("helm_kill_agent", {
+      runtime: session.runtime,
+      session: session.sessionId,
+    });
+
   return {
     detectProject,
     addProject,
@@ -107,6 +237,13 @@ export function createHelmApi(invoke: InvokeFn) {
     removeWorkspace,
     listWorkspaces,
     workspaceEnv,
+    listHarnesses,
+    spawnAgent,
+    attachAgent,
+    writeAgent,
+    resizeAgent,
+    agentStatus,
+    killAgent,
   };
 }
 

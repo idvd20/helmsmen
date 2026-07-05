@@ -1,6 +1,6 @@
 pub mod modules;
 
-use modules::{agent, fs, git, history, net, pty, registry, secrets, shell, workspace};
+use modules::{agent, fs, git, harness, history, net, pty, registry, runtime, secrets, shell, workspace};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 #[cfg(target_os = "macos")]
@@ -161,6 +161,9 @@ pub fn run() {
             Ok(())
         })
         .manage(pty::PtyState::default())
+        // Helmsmen runtime layer: Agent Sessions on LocalPty (task #6,
+        // HELMSMEN integration point — see docs/fork-posture.md).
+        .manage(runtime::RuntimeState::default())
         .manage(shell::ShellState::default())
         .manage(secrets::SecretsState::default())
         .manage(fs::watch::FsWatchState::default())
@@ -255,6 +258,13 @@ pub fn run() {
             registry::commands::helm_remove_workspace,
             registry::commands::helm_list_workspaces,
             registry::commands::helm_workspace_env,
+            runtime::commands::helm_spawn_agent,
+            runtime::commands::helm_attach_agent,
+            runtime::commands::helm_write_agent,
+            runtime::commands::helm_resize_agent,
+            runtime::commands::helm_agent_status,
+            runtime::commands::helm_kill_agent,
+            harness::commands::helm_list_harnesses,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
