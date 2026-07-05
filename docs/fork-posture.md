@@ -51,10 +51,16 @@ command guard), `2bfffae` (path guard canonical re-check vs symlink traversal),
 The only Terax files Helmsmen may edit. Grow this list deliberately; anything
 not listed is upstream's territory.
 
-- _To be enumerated during M1 as the new modules land (tracked in issue #2)._
-  Expected candidates: app entry/router registration for the Helm surface,
-  settings schema (Terax AI side-panel toggle), workspace-root authorization
-  call site used by the cut pipeline.
+- `src-tauri/src/modules/mod.rs` — module declarations for the new Helmsmen
+  backend modules (`core`, `registry`; later `runtime`, `harness`, `hooks`).
+- `src-tauri/src/lib.rs` — registration only: manage
+  `registry::RegistryState` in `.setup()` and list the `helm_*` commands in
+  `invoke_handler` (task #4).
+- `src/main.tsx` — install the Helm dev console (`window.helmsmen`,
+  task #4); later the Helm surface registration.
+- _Still expected during M1+ (tracked in issue #2):_ settings schema (Terax
+  AI side-panel toggle), workspace-root authorization call site used by the
+  cut pipeline.
 
 ## Local, non-committed state
 

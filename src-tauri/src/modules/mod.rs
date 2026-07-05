@@ -1,10 +1,12 @@
 pub mod agent;
+pub mod core;
 pub mod fs;
 pub mod git;
 pub mod history;
 pub mod net;
 pub mod proc;
 pub mod pty;
+pub mod registry;
 pub mod secrets;
 pub mod shell;
 pub mod workspace;
