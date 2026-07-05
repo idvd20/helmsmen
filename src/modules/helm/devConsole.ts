@@ -1,6 +1,7 @@
-// Helmsmen dev console — the M1 surface for adding a Project.
+// Helmsmen dev console — the M1 surface for adding a Project and cutting
+// a Workspace.
 //
-// Exposes `window.helmsmen` in the main webview so a Project can be added
+// Exposes `window.helmsmen` in the main webview so both flows run
 // end-to-end from the devtools console:
 //
 //   await helmsmen.detectProject("/path/to/clone")   // prefill, editable
@@ -8,6 +9,11 @@
 //     baseBranch: "develop",                          // optional edits
 //   })
 //   await helmsmen.listProjects()
+//
+//   const { workspace, env } = await helmsmen.cutWorkspace("prj-…", "fix-login")
+//   await helmsmen.listWorkspaces()
+//   await helmsmen.workspaceEnv(workspace.id)         // HELMSMEN_* set
+//   await helmsmen.removeWorkspace(workspace.id)      // frees the Slot
 //
 // Thin by design: every call goes straight to the Tauri commands, which
 // validate at the boundary and in the pure core.

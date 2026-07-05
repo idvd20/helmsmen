@@ -8,6 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::project::Project;
+use super::workspace::{lowest_free_slot, validate_workspace, Workspace};
 
 /// Whole-registry pure state. Serialized inside a versioned envelope by
 /// `modules::registry`.
@@ -16,12 +17,21 @@ use super::project::Project;
 pub struct CoreState {
     #[serde(default)]
     pub projects: Vec<Project>,
+    /// Live Workspaces across all Projects (removed on land/scuttle).
+    #[serde(default)]
+    pub workspaces: Vec<Workspace>,
 }
 
 /// Every mutation of Helmsmen state is an Event fed through [`apply`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     ProjectAdded { project: Project },
+    /// A Workspace was cut (worktree + branch already created by the
+    /// shell). Carries the full entity; `apply` enforces the Slot rule.
+    WorkspaceCut { workspace: Workspace },
+    /// A Workspace was removed (worktree + branch already cleaned up by
+    /// the shell). Frees its Slot implicitly.
+    WorkspaceRemoved { workspace_id: String },
 }
 
 /// Pure, serializable transition errors.
@@ -34,6 +44,15 @@ pub enum CoreError {
     },
     DuplicateProjectId(String),
     DuplicateRepoRoot(String),
+    UnknownProject(String),
+    UnknownWorkspace(String),
+    DuplicateWorkspaceId(String),
+    /// The branch is already used by a live Workspace of the same Project.
+    DuplicateBranch(String),
+    DuplicateWorktreePath(String),
+    /// The Slot rule: a cut must carry the lowest free integer among the
+    /// Project's live Workspaces.
+    SlotNotLowestFree { expected: u32, got: u32 },
 }
 
 impl fmt::Display for CoreError {
@@ -46,6 +65,21 @@ impl fmt::Display for CoreError {
             CoreError::DuplicateRepoRoot(root) => {
                 write!(f, "a project for {root:?} already exists")
             }
+            CoreError::UnknownProject(id) => write!(f, "no project with id {id:?}"),
+            CoreError::UnknownWorkspace(id) => write!(f, "no workspace with id {id:?}"),
+            CoreError::DuplicateWorkspaceId(id) => {
+                write!(f, "a workspace with id {id:?} already exists")
+            }
+            CoreError::DuplicateBranch(branch) => {
+                write!(f, "branch {branch:?} is already used by a live workspace")
+            }
+            CoreError::DuplicateWorktreePath(path) => {
+                write!(f, "worktree path {path:?} is already used by a live workspace")
+            }
+            CoreError::SlotNotLowestFree { expected, got } => write!(
+                f,
+                "slot {got} is not the lowest free slot (expected {expected})"
+            ),
         }
     }
 }
@@ -71,6 +105,47 @@ pub fn apply(state: CoreState, event: Event) -> Result<CoreState, CoreError> {
             }
             let mut next = state;
             next.projects.push(project);
+            Ok(next)
+        }
+        Event::WorkspaceCut { workspace } => {
+            validate_workspace(&workspace)?;
+            if !state.projects.iter().any(|p| p.id == workspace.project_id) {
+                return Err(CoreError::UnknownProject(workspace.project_id));
+            }
+            if state.workspaces.iter().any(|w| w.id == workspace.id) {
+                return Err(CoreError::DuplicateWorkspaceId(workspace.id));
+            }
+            if state
+                .workspaces
+                .iter()
+                .any(|w| w.project_id == workspace.project_id && w.branch == workspace.branch)
+            {
+                return Err(CoreError::DuplicateBranch(workspace.branch));
+            }
+            if state
+                .workspaces
+                .iter()
+                .any(|w| w.worktree_path == workspace.worktree_path)
+            {
+                return Err(CoreError::DuplicateWorktreePath(workspace.worktree_path));
+            }
+            let expected = lowest_free_slot(&state.workspaces, &workspace.project_id);
+            if workspace.slot != expected {
+                return Err(CoreError::SlotNotLowestFree {
+                    expected,
+                    got: workspace.slot,
+                });
+            }
+            let mut next = state;
+            next.workspaces.push(workspace);
+            Ok(next)
+        }
+        Event::WorkspaceRemoved { workspace_id } => {
+            if !state.workspaces.iter().any(|w| w.id == workspace_id) {
+                return Err(CoreError::UnknownWorkspace(workspace_id));
+            }
+            let mut next = state;
+            next.workspaces.retain(|w| w.id != workspace_id);
             Ok(next)
         }
     }
@@ -308,6 +383,246 @@ mod tests {
     fn repo_name_takes_last_component() {
         assert_eq!(repo_name("/a/b/repo"), Some("repo".to_string()));
         assert_eq!(repo_name("/"), None);
+    }
+
+    // --- apply: WorkspaceCut / WorkspaceRemoved (task #5) ---
+
+    fn workspace(id: &str, project_id: &str, slug: &str, slot: u32) -> Workspace {
+        Workspace {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            slug: slug.to_string(),
+            branch: format!("helm/{slug}"),
+            worktree_path: format!("/home/dev/.helmsmen/worktrees/helmsmen/{slug}-{slot}"),
+            slot,
+        }
+    }
+
+    fn state_with_project(id: &str) -> CoreState {
+        apply(
+            CoreState::default(),
+            Event::ProjectAdded {
+                project: project(id, &format!("/home/dev/src/{id}")),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn workspace_cut_appends_and_first_slot_is_one() {
+        let w = workspace("ws-1", "prj-1", "fix-login", 1);
+        let next = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut {
+                workspace: w.clone(),
+            },
+        )
+        .expect("valid cut must be accepted");
+        assert_eq!(next.workspaces, vec![w]);
+    }
+
+    #[test]
+    fn workspace_cut_requires_an_existing_project() {
+        let w = workspace("ws-1", "prj-ghost", "fix-login", 1);
+        let err = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut { workspace: w },
+        )
+        .unwrap_err();
+        assert_eq!(err, CoreError::UnknownProject("prj-ghost".to_string()));
+    }
+
+    #[test]
+    fn workspace_cut_enforces_the_lowest_free_slot() {
+        let s = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut {
+                workspace: workspace("ws-1", "prj-1", "a", 1),
+            },
+        )
+        .unwrap();
+        // Slot 2 is the lowest free; 3 must be rejected.
+        let err = apply(
+            s.clone(),
+            Event::WorkspaceCut {
+                workspace: workspace("ws-2", "prj-1", "b", 3),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CoreError::SlotNotLowestFree { expected: 2, got: 3 });
+        // A stale slot 1 (already taken) must be rejected too.
+        let err = apply(
+            s,
+            Event::WorkspaceCut {
+                workspace: workspace("ws-2", "prj-1", "b", 1),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CoreError::SlotNotLowestFree { expected: 2, got: 1 });
+    }
+
+    #[test]
+    fn removal_frees_the_slot_for_the_next_cut() {
+        let s = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut {
+                workspace: workspace("ws-1", "prj-1", "a", 1),
+            },
+        )
+        .unwrap();
+        let s = apply(
+            s,
+            Event::WorkspaceCut {
+                workspace: workspace("ws-2", "prj-1", "b", 2),
+            },
+        )
+        .unwrap();
+        let s = apply(
+            s,
+            Event::WorkspaceRemoved {
+                workspace_id: "ws-1".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.workspaces.len(), 1);
+        // Slot 1 is free again: a cut carrying slot 1 is accepted.
+        let s = apply(
+            s,
+            Event::WorkspaceCut {
+                workspace: workspace("ws-3", "prj-1", "c", 1),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.workspaces.iter().map(|w| w.slot).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn slots_are_allocated_per_project() {
+        let s = state_with_project("prj-1");
+        let s = apply(
+            s,
+            Event::ProjectAdded {
+                project: project("prj-2", "/home/dev/src/prj-2"),
+            },
+        )
+        .unwrap();
+        let s = apply(
+            s,
+            Event::WorkspaceCut {
+                workspace: workspace("ws-1", "prj-1", "a", 1),
+            },
+        )
+        .unwrap();
+        // prj-2's first cut also gets slot 1.
+        let mut w = workspace("ws-2", "prj-2", "a", 1);
+        w.worktree_path = "/home/dev/.helmsmen/worktrees/other/a-1".to_string();
+        apply(s, Event::WorkspaceCut { workspace: w }).expect("slots are per project");
+    }
+
+    #[test]
+    fn duplicate_workspace_id_branch_and_path_are_rejected() {
+        let s = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut {
+                workspace: workspace("ws-1", "prj-1", "a", 1),
+            },
+        )
+        .unwrap();
+
+        let mut dup_id = workspace("ws-1", "prj-1", "b", 2);
+        dup_id.worktree_path = "/home/dev/wt/b-2".to_string();
+        let err = apply(
+            s.clone(),
+            Event::WorkspaceCut { workspace: dup_id },
+        )
+        .unwrap_err();
+        assert_eq!(err, CoreError::DuplicateWorkspaceId("ws-1".to_string()));
+
+        let mut dup_branch = workspace("ws-2", "prj-1", "b", 2);
+        dup_branch.branch = "helm/a".to_string();
+        let err = apply(
+            s.clone(),
+            Event::WorkspaceCut {
+                workspace: dup_branch,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CoreError::DuplicateBranch("helm/a".to_string()));
+
+        let mut dup_path = workspace("ws-2", "prj-1", "b", 2);
+        dup_path.worktree_path =
+            "/home/dev/.helmsmen/worktrees/helmsmen/a-1".to_string();
+        let err = apply(
+            s,
+            Event::WorkspaceCut {
+                workspace: dup_path,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CoreError::DuplicateWorktreePath(
+                "/home/dev/.helmsmen/worktrees/helmsmen/a-1".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_cut_rejects_traversal_in_worktree_path() {
+        let mut w = workspace("ws-1", "prj-1", "a", 1);
+        w.worktree_path = "/home/dev/wt/../../etc".to_string();
+        let err = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut { workspace: w },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::Invalid {
+                field: "worktreePath",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn removing_an_unknown_workspace_is_rejected() {
+        let err = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceRemoved {
+                workspace_id: "ws-ghost".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CoreError::UnknownWorkspace("ws-ghost".to_string()));
+    }
+
+    #[test]
+    fn workspaces_serialize_with_camel_case_fields_and_round_trip() {
+        let s = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut {
+                workspace: workspace("ws-1", "prj-1", "a", 1),
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&s).unwrap();
+        let w = &json["workspaces"][0];
+        for key in ["id", "projectId", "slug", "branch", "worktreePath", "slot"] {
+            assert!(w.get(key).is_some(), "missing camelCase key {key}");
+        }
+        let back: CoreState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn registry_files_without_workspaces_still_deserialize() {
+        // Files written by the task-#4 build have no `workspaces` key.
+        let s: CoreState = serde_json::from_str(r#"{ "projects": [] }"#).unwrap();
+        assert_eq!(s, CoreState::default());
     }
 
     // --- serialization shape (locks the registry JSON contract) ---

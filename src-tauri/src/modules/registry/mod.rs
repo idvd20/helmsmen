@@ -8,6 +8,7 @@
 
 pub mod commands;
 pub mod detect;
+pub mod worktree;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

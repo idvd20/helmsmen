@@ -5,6 +5,7 @@
 //! data), so a hostile frontend payload can neither register a phantom
 //! clone nor smuggle an invalid entity into the registry.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,8 +14,11 @@ use tauri::State;
 
 use crate::modules::core::project::{repo_name, Project};
 use crate::modules::core::state::Event;
+use crate::modules::core::workspace::Workspace;
+use crate::modules::workspace::WorkspaceRegistry;
 
 use super::detect::{detect_project, resolve_repo_root, ProjectDetection};
+use super::worktree::{self, CutWorkspace};
 use super::RegistryState;
 
 /// Detect prefill values for a picked local clone. Reads git metadata
@@ -69,6 +73,53 @@ pub fn helm_add_project(
 #[tauri::command]
 pub fn helm_list_projects(registry: State<'_, RegistryState>) -> Result<Vec<Project>, String> {
     Ok(registry.snapshot()?.projects)
+}
+
+/// The cut form payload: which Project, and the slug that fills the
+/// branch template and names the worktree directory.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CutWorkspaceInput {
+    pub project_id: String,
+    pub slug: String,
+}
+
+/// Cut a Workspace (task #5): worktree + branch off base with the branch
+/// template, Slot = lowest free integer in the Project, worktree path
+/// authorized as a Terax workspace root, `HELMSMEN_*` env assembled.
+#[tauri::command]
+pub fn helm_cut_workspace(
+    registry: State<'_, RegistryState>,
+    roots: State<'_, WorkspaceRegistry>,
+    input: CutWorkspaceInput,
+) -> Result<CutWorkspace, String> {
+    worktree::cut(&registry, &roots, &input.project_id, &input.slug)
+}
+
+/// Remove a Workspace: delete worktree and branch, free the Slot, update
+/// the registry.
+#[tauri::command]
+pub fn helm_remove_workspace(
+    registry: State<'_, RegistryState>,
+    workspace_id: String,
+) -> Result<(), String> {
+    worktree::remove(&registry, &workspace_id)
+}
+
+/// List all live Workspaces.
+#[tauri::command]
+pub fn helm_list_workspaces(registry: State<'_, RegistryState>) -> Result<Vec<Workspace>, String> {
+    Ok(registry.snapshot()?.workspaces)
+}
+
+/// The `HELMSMEN_*` env for one Workspace — the set everything spawned in
+/// it (setup script, Processes, Agent Sessions) receives.
+#[tauri::command]
+pub fn helm_workspace_env(
+    registry: State<'_, RegistryState>,
+    workspace_id: String,
+) -> Result<BTreeMap<String, String>, String> {
+    worktree::workspace_env(&registry, &workspace_id)
 }
 
 /// Opaque, unique-per-process registry id. Uniqueness across restarts
