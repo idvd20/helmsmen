@@ -10,6 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::cut::CutState;
 use super::project::{validate_abs_path, validate_ref_name, Project};
 use super::state::CoreError;
 
@@ -38,6 +39,10 @@ pub struct Workspace {
     /// Lowest free integer among the Project's live Workspaces at cut
     /// time. Helmsmen hands it out and never interprets it.
     pub slot: u32,
+    /// Cut-pipeline lifecycle (task #8). Defaults to a completed cut so
+    /// registry files written before #8 keep loading.
+    #[serde(default)]
+    pub cut: CutState,
 }
 
 /// Validate a slug as pure data: it must be safe both as a branch-template
@@ -180,6 +185,7 @@ mod tests {
             branch: format!("helm/task-{slot}"),
             worktree_path: format!("/home/dev/.helmsmen/worktrees/helmsmen/task-{slot}-{slot}"),
             slot,
+            cut: CutState::default(),
         }
     }
 

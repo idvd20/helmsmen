@@ -27,6 +27,20 @@
 //   const [feature] = await helmsmen.listProfiles(p.id)     // seeded copies
 //   await helmsmen.updateProfile({ ...feature, verifyCommand: "pnpm test" })
 //
+// The full cut pipeline, ambient (task #8) — returns at enqueue; fetch,
+// worktree add, authorize, carry-overs, setup script, harness wiring, and
+// the first Agent Session (Profile snippet + Brief) run in the background.
+// A step failure parks the Workspace in Needs you with that step's log:
+//
+//   const w = await helmsmen.cutPipeline({
+//     projectId: p.id,
+//     slug: "fix-login",
+//     profileId: feature.id,
+//     brief: "fix the login page",
+//   })
+//   const [ws] = await helmsmen.listWorkspaces()  // ws.cut: cutting |
+//                                                 // complete | failed{step,log}
+//
 // Thin by design: every call goes straight to the Tauri commands, which
 // validate at the boundary and in the pure core. The frontend never
 // spawns processes, runs git, or touches repo files; session output is

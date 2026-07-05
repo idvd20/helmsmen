@@ -16,6 +16,18 @@ use crate::modules::workspace::WorkspaceRegistry;
 
 use super::SpawnSpec;
 
+/// Per-launch values from the Profile (task #8): model and opening
+/// prompt. `Default` = launch bare (M1 behavior, and every Session after
+/// the first).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchOverrides<'a> {
+    /// Harness-specific model; empty = the Harness default.
+    pub model: &'a str,
+    /// Opening prompt (Profile snippet with the Brief composed in);
+    /// empty = start without a prompt.
+    pub opening_prompt: &'a str,
+}
+
 pub fn prepare_spawn(
     registry: &RegistryState,
     roots: &WorkspaceRegistry,
@@ -26,16 +38,25 @@ pub fn prepare_spawn(
 ) -> Result<SpawnSpec, String> {
     let harness = crate::modules::harness::by_id(harness_id)
         .ok_or_else(|| format!("unknown harness {harness_id:?}"))?;
-    prepare_spawn_with(registry, roots, workspace_id, harness, cols, rows)
+    prepare_spawn_with(
+        registry,
+        roots,
+        workspace_id,
+        harness,
+        LaunchOverrides::default(),
+        cols,
+        rows,
+    )
 }
 
-/// Trait-typed variant so tests (and later Profiles) can hand in any
-/// Harness.
+/// Trait-typed variant so tests, the cut pipeline, and later Profiles can
+/// hand in any Harness (plus that launch's overrides).
 pub fn prepare_spawn_with(
     registry: &RegistryState,
     roots: &WorkspaceRegistry,
     workspace_id: &str,
     harness: &dyn Harness,
+    overrides: LaunchOverrides<'_>,
     cols: u16,
     rows: u16,
 ) -> Result<SpawnSpec, String> {
@@ -73,6 +94,8 @@ pub fn prepare_spawn_with(
     let ctx = LaunchContext {
         workspace_root: &worktree,
         env: &env,
+        model: overrides.model,
+        opening_prompt: overrides.opening_prompt,
     };
     apply_config_injection(&worktree, &harness.config_injection(&ctx))?;
     let plan = harness.launch_plan(&ctx);
@@ -92,10 +115,11 @@ pub fn prepare_spawn_with(
     })
 }
 
-/// Write the Harness's config files into the worktree (M3: hook wiring).
-/// Paths are hostile until proven worktree-relative: absolute paths and
-/// any `..` component are rejected before a byte is written.
-fn apply_config_injection(worktree: &str, files: &[ConfigFile]) -> Result<(), String> {
+/// Write the Harness's config files into the worktree (M3: hook wiring;
+/// also the cut pipeline's harness-wiring step, task #8). Paths are
+/// hostile until proven worktree-relative: absolute paths and any `..`
+/// component are rejected before a byte is written.
+pub(crate) fn apply_config_injection(worktree: &str, files: &[ConfigFile]) -> Result<(), String> {
     for file in files {
         let rel = Path::new(&file.rel_path);
         let escapes = rel.is_absolute()
@@ -289,8 +313,16 @@ mod tests {
             script: write_script(f._tmp.path()),
         };
 
-        let spec = prepare_spawn_with(&f.registry, &f.roots, &cut.workspace.id, &agent, 120, 32)
-            .unwrap();
+        let spec = prepare_spawn_with(
+            &f.registry,
+            &f.roots,
+            &cut.workspace.id,
+            &agent,
+            LaunchOverrides::default(),
+            120,
+            32,
+        )
+        .unwrap();
         assert_eq!(spec.cwd, cut.workspace.worktree_path);
         assert_eq!(spec.env["HELMSMEN_SLOT"], "1");
         assert_eq!(spec.env["HELMSMEN_WORKSPACE"], cut.workspace.worktree_path);
@@ -395,7 +427,16 @@ mod tests {
         let agent = FakeAgent {
             script: write_script(f._tmp.path()),
         };
-        prepare_spawn_with(&f.registry, &fresh_roots, &cut.workspace.id, &agent, 80, 24).unwrap();
+        prepare_spawn_with(
+            &f.registry,
+            &fresh_roots,
+            &cut.workspace.id,
+            &agent,
+            LaunchOverrides::default(),
+            80,
+            24,
+        )
+        .unwrap();
         assert!(fresh_roots.is_authorized(Path::new(&cut.workspace.worktree_path)));
         assert!(
             !fresh_roots.is_authorized(Path::new(&f.repo_root)),

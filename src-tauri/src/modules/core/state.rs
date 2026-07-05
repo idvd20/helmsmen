@@ -7,6 +7,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::cut::{truncate_log, CutState, CutStep};
 use super::profile::{validate_profile, Profile};
 use super::project::Project;
 use super::settings::{validate_settings, ProjectSettings};
@@ -47,6 +48,20 @@ pub enum Event {
     /// A Project-owned Profile was edited (full replacement by id). The
     /// Profile can never move to another Project.
     ProfileUpdated { profile: Profile },
+    /// A cut-pipeline step failed (task #8): park the Workspace as
+    /// Blocked ("Needs you") with the failing step's log. Data only —
+    /// tear-down already happened in the shell.
+    CutStepFailed {
+        workspace_id: String,
+        step: CutStep,
+        log: String,
+    },
+    /// The ambient cut pipeline finished every step; the first Agent
+    /// Session is running under `first_session_id`.
+    CutCompleted {
+        workspace_id: String,
+        first_session_id: String,
+    },
 }
 
 /// Pure, serializable transition errors.
@@ -70,6 +85,9 @@ pub enum CoreError {
     SlotNotLowestFree { expected: u32, got: u32 },
     UnknownProfile(String),
     DuplicateProfileId(String),
+    /// The cut lifecycle only advances while the pipeline runs: a parked
+    /// or completed cut accepts no further step events.
+    CutNotInProgress(String),
 }
 
 impl fmt::Display for CoreError {
@@ -100,6 +118,9 @@ impl fmt::Display for CoreError {
             CoreError::UnknownProfile(id) => write!(f, "no profile with id {id:?}"),
             CoreError::DuplicateProfileId(id) => {
                 write!(f, "a profile with id {id:?} already exists")
+            }
+            CoreError::CutNotInProgress(id) => {
+                write!(f, "the cut for workspace {id:?} is not in progress")
             }
         }
     }
@@ -230,11 +251,54 @@ pub fn apply(state: CoreState, event: Event) -> Result<CoreState, CoreError> {
             *slot = profile;
             Ok(next)
         }
+        Event::CutStepFailed {
+            workspace_id,
+            step,
+            log,
+        } => {
+            let mut next = state;
+            let workspace = cutting_workspace(&mut next, &workspace_id)?;
+            workspace.cut = CutState::Failed {
+                step,
+                // Bound the stored log here so no event can bloat the
+                // registry; the tail is the part that explains a failure.
+                log: truncate_log(&log),
+            };
+            Ok(next)
+        }
+        Event::CutCompleted {
+            workspace_id,
+            first_session_id,
+        } => {
+            let mut next = state;
+            let workspace = cutting_workspace(&mut next, &workspace_id)?;
+            workspace.cut = CutState::Complete { first_session_id };
+            Ok(next)
+        }
     }
+}
+
+/// Resolve a Workspace whose cut pipeline is still running. The lifecycle
+/// only advances Cutting -> Complete / Failed; anything else is a stale
+/// or duplicated event and must not overwrite the parked record.
+fn cutting_workspace<'a>(
+    state: &'a mut CoreState,
+    workspace_id: &str,
+) -> Result<&'a mut Workspace, CoreError> {
+    let workspace = state
+        .workspaces
+        .iter_mut()
+        .find(|w| w.id == workspace_id)
+        .ok_or_else(|| CoreError::UnknownWorkspace(workspace_id.to_string()))?;
+    if workspace.cut != CutState::Cutting {
+        return Err(CoreError::CutNotInProgress(workspace_id.to_string()));
+    }
+    Ok(workspace)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::cut::{CutState, CutStep, MAX_CUT_LOG_BYTES};
     use super::super::profile::seed_profiles;
     use super::super::project::{
         prefill, repo_name, validate_branch_template, validate_ref_name, DEFAULT_BRANCH_TEMPLATE,
@@ -480,6 +544,7 @@ mod tests {
             branch: format!("helm/{slug}"),
             worktree_path: format!("/home/dev/.helmsmen/worktrees/helmsmen/{slug}-{slot}"),
             slot,
+            cut: CutState::default(),
         }
     }
 
@@ -708,6 +773,197 @@ mod tests {
         // Files written by the task-#4 build have no `workspaces` key.
         let s: CoreState = serde_json::from_str(r#"{ "projects": [] }"#).unwrap();
         assert_eq!(s, CoreState::default());
+    }
+
+    // --- apply: cut-pipeline lifecycle (task #8) ---
+
+    fn state_with_cutting_workspace() -> CoreState {
+        let mut w = workspace("ws-1", "prj-1", "fix", 1);
+        w.cut = CutState::Cutting;
+        apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut { workspace: w },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_failed_step_parks_the_workspace_with_its_log() {
+        let s = apply(
+            state_with_cutting_workspace(),
+            Event::CutStepFailed {
+                workspace_id: "ws-1".to_string(),
+                step: CutStep::SetupScript,
+                log: "pnpm ERR! exit 7".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.workspaces[0].cut,
+            CutState::Failed {
+                step: CutStep::SetupScript,
+                log: "pnpm ERR! exit 7".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn cut_completed_records_the_first_session() {
+        let s = apply(
+            state_with_cutting_workspace(),
+            Event::CutCompleted {
+                workspace_id: "ws-1".to_string(),
+                first_session_id: "rt-42".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.workspaces[0].cut,
+            CutState::Complete {
+                first_session_id: "rt-42".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn cut_events_require_an_existing_workspace() {
+        for event in [
+            Event::CutStepFailed {
+                workspace_id: "ws-ghost".to_string(),
+                step: CutStep::Fetch,
+                log: "x".to_string(),
+            },
+            Event::CutCompleted {
+                workspace_id: "ws-ghost".to_string(),
+                first_session_id: "rt-1".to_string(),
+            },
+        ] {
+            let err = apply(state_with_cutting_workspace(), event).unwrap_err();
+            assert_eq!(err, CoreError::UnknownWorkspace("ws-ghost".to_string()));
+        }
+    }
+
+    #[test]
+    fn a_settled_cut_accepts_no_further_lifecycle_events() {
+        // Parked: a duplicate failure or a late completion must not
+        // overwrite the parked record.
+        let parked = apply(
+            state_with_cutting_workspace(),
+            Event::CutStepFailed {
+                workspace_id: "ws-1".to_string(),
+                step: CutStep::WorktreeAdd,
+                log: "git failed".to_string(),
+            },
+        )
+        .unwrap();
+        for event in [
+            Event::CutCompleted {
+                workspace_id: "ws-1".to_string(),
+                first_session_id: "rt-1".to_string(),
+            },
+            Event::CutStepFailed {
+                workspace_id: "ws-1".to_string(),
+                step: CutStep::SetupScript,
+                log: "later".to_string(),
+            },
+        ] {
+            let err = apply(parked.clone(), event).unwrap_err();
+            assert_eq!(err, CoreError::CutNotInProgress("ws-1".to_string()));
+        }
+        // Completed (the synchronous M1 cut): same rule.
+        let complete = apply(
+            state_with_project("prj-1"),
+            Event::WorkspaceCut {
+                workspace: workspace("ws-1", "prj-1", "fix", 1),
+            },
+        )
+        .unwrap();
+        let err = apply(
+            complete,
+            Event::CutStepFailed {
+                workspace_id: "ws-1".to_string(),
+                step: CutStep::SetupScript,
+                log: "x".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CoreError::CutNotInProgress("ws-1".to_string()));
+    }
+
+    #[test]
+    fn stored_step_logs_are_bounded() {
+        let s = apply(
+            state_with_cutting_workspace(),
+            Event::CutStepFailed {
+                workspace_id: "ws-1".to_string(),
+                step: CutStep::SetupScript,
+                log: "y".repeat(MAX_CUT_LOG_BYTES * 3),
+            },
+        )
+        .unwrap();
+        match &s.workspaces[0].cut {
+            CutState::Failed { log, .. } => {
+                assert!(log.len() <= MAX_CUT_LOG_BYTES + "[log truncated]\n".len());
+                assert!(log.starts_with("[log truncated]"));
+            }
+            other => panic!("expected a parked cut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parked_workspace_can_still_be_removed() {
+        let parked = apply(
+            state_with_cutting_workspace(),
+            Event::CutStepFailed {
+                workspace_id: "ws-1".to_string(),
+                step: CutStep::Fetch,
+                log: "no remote".to_string(),
+            },
+        )
+        .unwrap();
+        let s = apply(
+            parked,
+            Event::WorkspaceRemoved {
+                workspace_id: "ws-1".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(s.workspaces.is_empty());
+    }
+
+    #[test]
+    fn cut_lifecycle_round_trips_through_registry_json() {
+        let s = apply(
+            state_with_cutting_workspace(),
+            Event::CutStepFailed {
+                workspace_id: "ws-1".to_string(),
+                step: CutStep::HarnessWiring,
+                log: "hostile path".to_string(),
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["workspaces"][0]["cut"]["phase"], "failed");
+        assert_eq!(json["workspaces"][0]["cut"]["step"], "harnessWiring");
+        let back: CoreState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn workspaces_without_a_cut_key_load_as_complete() {
+        // Files written by the task-#5 build have no `cut` key.
+        let s: CoreState = serde_json::from_str(
+            r#"{ "projects": [], "workspaces": [{
+                "id": "ws-old",
+                "projectId": "prj-old",
+                "slug": "fix",
+                "branch": "helm/fix",
+                "worktreePath": "/home/dev/wt/fix-1",
+                "slot": 1
+            }] }"#,
+        )
+        .unwrap();
+        assert_eq!(s.workspaces[0].cut, CutState::default());
     }
 
     // --- apply: Profile seeding + divergence (task #7) ---

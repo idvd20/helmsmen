@@ -20,6 +20,7 @@ use crate::modules::core::workspace::Workspace;
 use crate::modules::workspace::WorkspaceRegistry;
 
 use super::detect::{detect_project, resolve_repo_root, ProjectDetection};
+use super::pipeline;
 use super::worktree::{self, CutWorkspace};
 use super::RegistryState;
 
@@ -167,6 +168,73 @@ pub fn helm_cut_workspace(
     input: CutWorkspaceInput,
 ) -> Result<CutWorkspace, String> {
     worktree::cut(&registry, &roots, &input.project_id, &input.slug)
+}
+
+/// The cut-pipeline form payload (task #8): Project, slug, the Profile
+/// the first Session launches under, the Brief, and the optional fetch.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CutPipelineInput {
+    pub project_id: String,
+    pub slug: String,
+    pub profile_id: String,
+    #[serde(default)]
+    pub brief: String,
+    #[serde(default)]
+    pub fetch: bool,
+}
+
+/// Cut a Workspace through the full ambient pipeline (task #8). The
+/// command only enqueues — boundary validation, Slot allocation,
+/// `HELMSMEN_*` env, one registry commit — and returns the Cutting
+/// Workspace immediately; every slow step (fetch, worktree add,
+/// authorize, carry-overs, setup script, harness wiring, first Agent
+/// Session) runs on a background thread and any failure parks the
+/// Workspace in Needs you with that step's log. The UI never blocks.
+#[tauri::command]
+pub fn helm_cut_pipeline(
+    app: tauri::AppHandle,
+    registry: State<'_, RegistryState>,
+    input: CutPipelineInput,
+) -> Result<Workspace, String> {
+    let enqueued = pipeline::enqueue(
+        &registry,
+        &pipeline::CutRequest {
+            project_id: input.project_id,
+            slug: input.slug,
+            profile_id: input.profile_id,
+            brief: input.brief,
+            fetch: input.fetch,
+        },
+    )?;
+    let workspace = enqueued.workspace.clone();
+
+    // Fully ambient from here: the pipeline owns its own thread and
+    // reports only through registry events (parked or completed).
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let registry = app.state::<RegistryState>();
+        let roots = app.state::<WorkspaceRegistry>();
+        let runtimes = app.state::<crate::modules::runtime::RuntimeState>();
+        // Both resolutions were verified at enqueue / are compiled-in;
+        // failing here means the app is misassembled — still park rather
+        // than lose the cut silently.
+        let runtime = match runtimes.get(crate::modules::runtime::LOCAL_PTY) {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                return pipeline::park_unlaunchable(&registry, &enqueued, e);
+            }
+        };
+        let Some(harness) = crate::modules::harness::by_id(&enqueued.profile.harness_id) else {
+            return pipeline::park_unlaunchable(
+                &registry,
+                &enqueued,
+                format!("unknown harness {:?}", enqueued.profile.harness_id),
+            );
+        };
+        pipeline::run(&registry, &roots, runtime.as_ref(), harness, &enqueued);
+    });
+    Ok(workspace)
 }
 
 /// Remove a Workspace: delete worktree and branch, free the Slot, update

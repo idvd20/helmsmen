@@ -76,6 +76,25 @@ export interface AddProjectInput {
   branchTemplate: string;
 }
 
+/** One effectful step of the cut pipeline, in PRD order. */
+export type HelmCutStep =
+  | "fetch"
+  | "worktreeAdd"
+  | "authorizeRoot"
+  | "copyCarryOvers"
+  | "setupScript"
+  | "harnessWiring"
+  | "launchSession";
+
+/** Where a Workspace is in its cut lifecycle. A `failed` cut carries the
+ * failing step and its log (hostile process output — render as text
+ * only); `complete` records the first Agent Session's runtime id (empty
+ * = unknown: pre-pipeline cuts or an app restart). */
+export type HelmCutState =
+  | { phase: "cutting" }
+  | { phase: "complete"; firstSessionId: string }
+  | { phase: "failed"; step: HelmCutStep; log: string };
+
 /** One task: one git worktree on its own branch under a Project. */
 export interface HelmWorkspace {
   id: string;
@@ -84,6 +103,38 @@ export interface HelmWorkspace {
   branch: string;
   worktreePath: string;
   slot: number;
+  cut: HelmCutState;
+}
+
+/** Derived Workspace status — the wall's rank order. Never stored; the
+ * backend derivation lives in the pure core (`core::cut::derive_status`)
+ * and this mirrors it for list rendering. */
+export type HelmWorkspaceStatus = "blocked" | "working" | "done" | "idle";
+
+/** Display aliases per the PRD: Blocked = "Needs you", Done = "To
+ * review". */
+export const HELM_STATUS_ALIAS: Record<HelmWorkspaceStatus, string> = {
+  blocked: "Needs you",
+  working: "Working",
+  done: "To review",
+  idle: "Idle",
+};
+
+/** Derive a Workspace's status from its cut lifecycle (M2: the cut is
+ * the only status source; Session-driven Working/Done arrive with the
+ * control plane at M3). A failed cut parks the Workspace as blocked
+ * ("Needs you"). */
+export function deriveWorkspaceStatus(
+  workspace: Pick<HelmWorkspace, "cut">,
+): HelmWorkspaceStatus {
+  switch (workspace.cut.phase) {
+    case "failed":
+      return "blocked";
+    case "cutting":
+      return "working";
+    case "complete":
+      return "idle";
+  }
 }
 
 /** What a cut returns: the live Workspace plus the assembled `HELMSMEN_*`
@@ -178,6 +229,21 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
     invoke<HelmCutWorkspace>("helm_cut_workspace", {
       input: { projectId, slug },
     });
+
+  /** Cut a Workspace through the full ambient pipeline (task #8): the
+   * command returns the Cutting Workspace at enqueue; fetch (optional),
+   * worktree add, authorization, carry-overs, setup script, harness
+   * wiring, and the first Agent Session (Profile snippet + Brief as the
+   * opening prompt) all run in the background. Any step failure parks
+   * the Workspace in Needs you with that step's log — poll
+   * `listWorkspaces` and read `cut`. */
+  const cutPipeline = (input: {
+    projectId: string;
+    slug: string;
+    profileId: string;
+    brief: string;
+    fetch?: boolean;
+  }) => invoke<HelmWorkspace>("helm_cut_pipeline", { input });
 
   /** Remove a Workspace: delete worktree and branch, free the Slot. */
   const removeWorkspace = (workspaceId: string) =>
@@ -299,6 +365,7 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
     listProjects,
     addProjectFromPath,
     cutWorkspace,
+    cutPipeline,
     removeWorkspace,
     listWorkspaces,
     workspaceEnv,

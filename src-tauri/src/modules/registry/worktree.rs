@@ -26,10 +26,11 @@ use crate::modules::workspace::WorkspaceRegistry;
 
 use super::RegistryState;
 
-/// Serializes cut/remove so two concurrent cuts cannot compute the same
-/// Slot from the same snapshot (the pure core would reject the loser, but
-/// only after its worktree was created and had to be torn down again).
-static CUT_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes cut/remove — and the ambient pipeline's enqueue (task #8) —
+/// so two concurrent cuts cannot compute the same Slot from the same
+/// snapshot (the pure core would reject the loser, but only after its
+/// worktree was created and had to be torn down again).
+pub(crate) static CUT_LOCK: Mutex<()> = Mutex::new(());
 
 /// What a cut hands back: the live Workspace plus the assembled
 /// `HELMSMEN_*` env every later pipeline step spawns with.
@@ -104,7 +105,10 @@ pub fn cut(
         .authorize(&canonical)
         .map_err(|e| cleanup(format!("cannot authorize workspace root {canonical:?}: {e}")))?;
 
-    // 3. Slot + entity through the pure core; persist atomically.
+    // 3. Slot + entity through the pure core; persist atomically. This
+    // synchronous M1 cut finishes everything before committing, so its
+    // cut lifecycle is Complete from the start (the ambient pipeline of
+    // task #8 lives in `super::pipeline`).
     let workspace = Workspace {
         id: next_workspace_id(),
         project_id: project.id.clone(),
@@ -112,6 +116,7 @@ pub fn cut(
         branch: branch.clone(),
         worktree_path: canonical,
         slot,
+        cut: Default::default(),
     };
     registry
         .commit(Event::WorkspaceCut {
@@ -190,7 +195,7 @@ pub fn workspace_env(
 
 /// Tear-down for a failed cut. Best effort: the cut error stays the
 /// user-visible one, cleanup failures are only logged.
-fn remove_worktree_best_effort(repo_root: &str, path: &str, branch: &str) {
+pub(crate) fn remove_worktree_best_effort(repo_root: &str, path: &str, branch: &str) {
     let root = Path::new(repo_root);
     if let Err(e) = run_git(root, &["worktree", "remove", "--force", path]) {
         log::warn!("cut rollback: cannot remove worktree {path:?}: {e}");
@@ -202,7 +207,7 @@ fn remove_worktree_best_effort(repo_root: &str, path: &str, branch: &str) {
     }
 }
 
-fn branch_exists(repo_root: &Path, branch: &str) -> bool {
+pub(crate) fn branch_exists(repo_root: &Path, branch: &str) -> bool {
     run_git(
         repo_root,
         &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
@@ -212,7 +217,7 @@ fn branch_exists(repo_root: &Path, branch: &str) -> bool {
 
 /// Run git with `-C dir`; a non-zero exit is an error carrying stderr (the
 /// cut pipeline surfaces it as the failing step's log).
-fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
     crate::modules::proc::hide_console(&mut cmd);
@@ -226,7 +231,7 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Opaque, unique-per-process registry id (same scheme as project ids);
 /// the pure core still rejects duplicates as a final guard.
-fn next_workspace_id() -> String {
+pub(crate) fn next_workspace_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)

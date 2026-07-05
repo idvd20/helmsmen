@@ -5371,6 +5371,7 @@ dependencies = [
  "bytes",
  "dirs 6.0.0",
  "futures-util",
+ "glob",
  "globset",
  "grep-matcher",
  "grep-regex",

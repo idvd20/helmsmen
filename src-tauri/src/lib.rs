@@ -255,6 +255,7 @@ pub fn run() {
             registry::commands::helm_add_project,
             registry::commands::helm_list_projects,
             registry::commands::helm_cut_workspace,
+            registry::commands::helm_cut_pipeline,
             registry::commands::helm_remove_workspace,
             registry::commands::helm_list_workspaces,
             registry::commands::helm_workspace_env,

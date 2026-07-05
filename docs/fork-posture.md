@@ -56,7 +56,11 @@ not listed is upstream's territory.
 - `src-tauri/src/lib.rs` — registration only: manage
   `registry::RegistryState` in `.setup()`, manage `runtime::RuntimeState`,
   and list the `helm_*` commands in `invoke_handler` (tasks #4, #5, #6;
-  #7 adds the Project-settings/Profile commands to the same list).
+  #7 adds the Project-settings/Profile commands, #8 adds
+  `helm_cut_pipeline` to the same list).
+- `src-tauri/Cargo.toml` — dependency additions only (task #8 adds `glob`
+  for carry-over matching; it was already in the lock as a transitive
+  dependency, and `cargo-deny check licenses` gates every addition).
 - `src/main.tsx` — install the Helm dev console (`window.helmsmen`,
   task #4); later the Helm surface registration.
 - _Still expected during M1+ (tracked in issue #2):_ settings schema (Terax
@@ -71,6 +75,13 @@ The runtime/harness layer (task #6) likewise stays out of upstream modules:
 `modules::runtime::local_pty` builds on the `portable-pty` crate directly
 (Terax's `modules::pty` is untouched), and Agent Session spawns re-use
 `WorkspaceRegistry::authorize` for the cut worktree only.
+
+The ambient cut pipeline (task #8) lives entirely in Helmsmen modules
+(`modules::registry::pipeline` orchestrating, lifecycle events in
+`modules::core::cut`). It touches upstream only through existing public
+seams — `WorkspaceRegistry::authorize` and `modules::proc::hide_console` —
+plus the enumerated `lib.rs` command registration and the `glob`
+dependency in `Cargo.toml`.
 
 ## Local, non-committed state
 
