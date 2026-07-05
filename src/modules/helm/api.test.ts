@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  type ChannelFactory,
   createHelmApi,
+  type HelmAgentSession,
   type HelmCutWorkspace,
+  type HelmHarness,
   type HelmProject,
   type HelmProjectDetection,
   type InvokeFn,
@@ -185,5 +188,162 @@ describe("createHelmApi", () => {
         },
       },
     ]);
+  });
+});
+
+// Locks the frontend seam of task #6 (M1: Runtime + Harness traits): the
+// dev console talks to exactly these session commands with opaque ids
+// and injected channels; every OS decision (worktree, env, launch
+// command) stays backend-side. Runtime/Harness behavior itself is
+// covered by the Rust conformance suite and spawn tests.
+
+interface FakeChannel<T = unknown> {
+  deliver: (message: T) => void;
+}
+
+function fakeChannels(): {
+  makeChannel: ChannelFactory;
+  channels: FakeChannel[];
+} {
+  const channels: FakeChannel[] = [];
+  const makeChannel: ChannelFactory = <T>(onMessage: (message: T) => void) => {
+    const channel: FakeChannel<T> = { deliver: onMessage };
+    channels.push(channel as FakeChannel);
+    return channel;
+  };
+  return { makeChannel, channels };
+}
+
+const session: HelmAgentSession = {
+  sessionId: "lpty-1",
+  runtime: "local-pty",
+  harnessId: "claude-code",
+  workspaceId: "ws-1",
+};
+
+const harness: HelmHarness = {
+  id: "claude-code",
+  displayName: "Claude Code",
+  caps: {
+    resume: true,
+    controlPlaneHooks: true,
+    agentSignal: true,
+    costTelemetry: true,
+    mcpConfig: true,
+    modelSelect: true,
+  },
+};
+
+describe("createHelmApi agent sessions", () => {
+  it("spawnAgent invokes helm_spawn_agent with input and both channels", async () => {
+    const { invoke, calls } = fakeInvoke({ helm_spawn_agent: session });
+    const { makeChannel, channels } = fakeChannels();
+    const api = createHelmApi(invoke, makeChannel);
+    await expect(
+      api.spawnAgent("ws-1", { cols: 120, rows: 32 }),
+    ).resolves.toEqual(session);
+    expect(channels).toHaveLength(2);
+    expect(calls).toEqual([
+      [
+        "helm_spawn_agent",
+        {
+          input: {
+            workspaceId: "ws-1",
+            harnessId: undefined,
+            runtime: undefined,
+            cols: 120,
+            rows: 32,
+          },
+          onData: channels[0],
+          onExit: channels[1],
+        },
+      ],
+    ]);
+  });
+
+  it("delivers stream bytes as Uint8Array and exit codes verbatim", async () => {
+    const { invoke } = fakeInvoke({ helm_spawn_agent: session });
+    const { makeChannel, channels } = fakeChannels();
+    const api = createHelmApi(invoke, makeChannel);
+    const seen: Uint8Array[] = [];
+    const exits: number[] = [];
+    await api.spawnAgent("ws-1", {
+      onData: (bytes) => seen.push(bytes),
+      onExit: (code) => exits.push(code),
+    });
+    const hostile = new TextEncoder().encode("\x1b]0;owned\x07data");
+    (channels[0] as FakeChannel<ArrayBuffer>).deliver(
+      hostile.buffer as ArrayBuffer,
+    );
+    (channels[1] as FakeChannel<number>).deliver(7);
+    expect(seen).toHaveLength(1);
+    expect(new TextDecoder().decode(seen[0])).toBe("\x1b]0;owned\x07data");
+    expect(exits).toEqual([7]);
+  });
+
+  it("spawnAgent without a channel factory fails loudly, not silently", async () => {
+    const { invoke, calls } = fakeInvoke({ helm_spawn_agent: session });
+    const api = createHelmApi(invoke);
+    expect(() => api.spawnAgent("ws-1")).toThrow(/channel factory/);
+    expect(calls).toEqual([]);
+  });
+
+  it("attachAgent invokes helm_attach_agent with the echoed handle", async () => {
+    const { invoke, calls } = fakeInvoke({ helm_attach_agent: undefined });
+    const { makeChannel, channels } = fakeChannels();
+    const api = createHelmApi(invoke, makeChannel);
+    await api.attachAgent(session, {});
+    expect(calls).toEqual([
+      [
+        "helm_attach_agent",
+        {
+          runtime: "local-pty",
+          session: "lpty-1",
+          onData: channels[0],
+          onExit: channels[1],
+        },
+      ],
+    ]);
+  });
+
+  it("writeAgent types into the session by id only", async () => {
+    const { invoke, calls } = fakeInvoke({ helm_write_agent: undefined });
+    const api = createHelmApi(invoke);
+    await api.writeAgent(session, "hello\r");
+    expect(calls).toEqual([
+      [
+        "helm_write_agent",
+        { runtime: "local-pty", session: "lpty-1", data: "hello\r" },
+      ],
+    ]);
+  });
+
+  it("resizeAgent, agentStatus, and killAgent echo the handle", async () => {
+    const { invoke, calls } = fakeInvoke({
+      helm_resize_agent: undefined,
+      helm_agent_status: { state: "running" },
+      helm_kill_agent: undefined,
+    });
+    const api = createHelmApi(invoke);
+    await api.resizeAgent(session, 200, 50);
+    await expect(api.agentStatus(session)).resolves.toEqual({
+      state: "running",
+    });
+    await api.killAgent(session);
+    expect(calls).toEqual([
+      [
+        "helm_resize_agent",
+        { runtime: "local-pty", session: "lpty-1", cols: 200, rows: 50 },
+      ],
+      ["helm_agent_status", { runtime: "local-pty", session: "lpty-1" }],
+      ["helm_kill_agent", { runtime: "local-pty", session: "lpty-1" }],
+    ]);
+  });
+
+  it("listHarnesses surfaces the in-code Cap sets", async () => {
+    const { invoke, calls } = fakeInvoke({ helm_list_harnesses: [harness] });
+    const api = createHelmApi(invoke);
+    await expect(api.listHarnesses()).resolves.toEqual([harness]);
+    expect(calls).toEqual([["helm_list_harnesses", undefined]]);
   });
 });
