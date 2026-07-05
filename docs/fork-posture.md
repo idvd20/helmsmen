@@ -83,6 +83,22 @@ seams — `WorkspaceRegistry::authorize` and `modules::proc::hide_console` —
 plus the enumerated `lib.rs` command registration and the `glob`
 dependency in `Cargo.toml`.
 
+The Helm wall (task #10) added **no** shared-file edit. It lives entirely
+in `src/modules/helm`: the tested pure view-model (`viewModel.ts` — status
+rollup, rank sort, header counts, elapsed minutes, all deterministic over
+data), the presentational React surface (`Helm.tsx`, `WorkspaceCard.tsx`),
+and the host container `HelmView` (`HelmView.tsx`). The status rollup is
+also mirrored in the pure core (`core::cut::roll_up_status` + `rank`) so
+the "derived, never stored" rule lives on both sides of the seam.
+`HelmView` is the surface #9 (New Workspace) and #12 (Zoom) build on;
+Session chips call an injected `onZoomSession` — a logging placeholder now,
+wired so #12 takes it over. **Mounting into the app shell is kept interim
+and minimal**: the existing `window.helmsmen` dev console (installed in
+`main.tsx` at task #4) grew `openHelm()` / `closeHelm()`, which mount the
+wall as a full-window overlay. Promoting the Helm to a real route / the
+default home view is a later upstream integration point, deliberately left
+for when the view switch (`esc`/`t`) and repo picker (#14) land.
+
 ## Local, non-committed state
 
 `.git/info/exclude` carries the per-clone excludes (`.pipeline/`,

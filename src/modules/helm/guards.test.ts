@@ -15,8 +15,17 @@ import { describe, expect, it } from "vitest";
 const helmDir = dirname(fileURLToPath(import.meta.url));
 
 function sourceFiles(): string[] {
+  // Guard TS and TSX render code alike: the wall's React components
+  // (task #10) show hostile agent/PTY text and must never reach for an
+  // HTML sink (dangerouslySetInnerHTML etc.) any more than the DOM
+  // helpers do.
   return readdirSync(helmDir)
-    .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))
+    .filter(
+      (f) =>
+        (f.endsWith(".ts") || f.endsWith(".tsx")) &&
+        !f.endsWith(".test.ts") &&
+        !f.endsWith(".test.tsx"),
+    )
     .map((f) => join(helmDir, f));
 }
 
