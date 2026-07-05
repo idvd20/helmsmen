@@ -53,6 +53,7 @@ import {
   type HelmAgentSession,
   type SpawnAgentOptions,
 } from "./api";
+import { mountHelmOverlay, unmountHelmOverlay } from "./HelmView";
 import { openStreamView } from "./streamView";
 
 const makeChannel: ChannelFactory = <T>(onMessage: (message: T) => void) => {
@@ -82,7 +83,12 @@ function createDevConsole() {
     }
   };
 
-  return { ...api, spawnAgentView };
+  /** Open the Helm wall as a full-window overlay (the M2 home view).
+   * `helmsmen.openHelm()` / `helmsmen.closeHelm()` from the console. */
+  const openHelm = () => mountHelmOverlay();
+  const closeHelm = () => unmountHelmOverlay();
+
+  return { ...api, spawnAgentView, openHelm, closeHelm };
 }
 
 type HelmDevConsole = ReturnType<typeof createDevConsole>;

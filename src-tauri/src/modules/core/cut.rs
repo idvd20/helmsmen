@@ -161,6 +161,48 @@ impl WorkspaceStatus {
             WorkspaceStatus::Idle => "Idle",
         }
     }
+
+    /// The Helm wall's rank order: Blocked 0 -> Done 1 -> Working 2 ->
+    /// Idle 3 — the canonical attention order, applied as a sort across
+    /// all Projects (not sections). Lower ranks float to the top.
+    pub fn rank(self) -> u8 {
+        match self {
+            WorkspaceStatus::Blocked => 0,
+            WorkspaceStatus::Done => 1,
+            WorkspaceStatus::Working => 2,
+            WorkspaceStatus::Idle => 3,
+        }
+    }
+}
+
+/// Roll a Workspace's status up from its Sessions, per the PRD rule: any
+/// Session blocked -> Blocked; else any working -> Working; else all done
+/// -> Done; else Idle. The status is derived, never stored.
+///
+/// `cut_status` is the [`derive_status`] result: a failed cut parks the
+/// Workspace as Blocked ("Needs you") regardless of its Sessions, and
+/// with no Sessions the cut-derived status stands (M2: the cut is the
+/// only status source until the control plane feeds Session status at
+/// M3). This is the pure-core seam the frontend view-model mirrors.
+pub fn roll_up_status(
+    cut_status: WorkspaceStatus,
+    sessions: &[WorkspaceStatus],
+) -> WorkspaceStatus {
+    if cut_status == WorkspaceStatus::Blocked {
+        return WorkspaceStatus::Blocked;
+    }
+    if sessions.is_empty() {
+        return cut_status;
+    }
+    if sessions.contains(&WorkspaceStatus::Blocked) {
+        WorkspaceStatus::Blocked
+    } else if sessions.contains(&WorkspaceStatus::Working) {
+        WorkspaceStatus::Working
+    } else if sessions.iter().all(|s| *s == WorkspaceStatus::Done) {
+        WorkspaceStatus::Done
+    } else {
+        WorkspaceStatus::Idle
+    }
 }
 
 /// Derive a Workspace's status. At M2 only the cut lifecycle feeds it: a
@@ -369,5 +411,97 @@ mod tests {
             serde_json::json!("blocked")
         );
         assert_eq!(WorkspaceStatus::Done.display_alias(), "To review");
+    }
+
+    // --- wall rank order (never stored; a sort, not sections) ---
+
+    #[test]
+    fn rank_orders_needs_you_then_to_review_then_working_then_idle() {
+        assert_eq!(WorkspaceStatus::Blocked.rank(), 0);
+        assert_eq!(WorkspaceStatus::Done.rank(), 1);
+        assert_eq!(WorkspaceStatus::Working.rank(), 2);
+        assert_eq!(WorkspaceStatus::Idle.rank(), 3);
+
+        let mut statuses = [
+            WorkspaceStatus::Idle,
+            WorkspaceStatus::Working,
+            WorkspaceStatus::Blocked,
+            WorkspaceStatus::Done,
+        ];
+        statuses.sort_by_key(|s| s.rank());
+        assert_eq!(
+            statuses,
+            [
+                WorkspaceStatus::Blocked,
+                WorkspaceStatus::Done,
+                WorkspaceStatus::Working,
+                WorkspaceStatus::Idle,
+            ]
+        );
+    }
+
+    // --- Session rollup (the PRD rule, derived not stored) ---
+
+    #[test]
+    fn a_failed_cut_parks_blocked_regardless_of_sessions() {
+        assert_eq!(
+            roll_up_status(
+                WorkspaceStatus::Blocked,
+                &[WorkspaceStatus::Working, WorkspaceStatus::Done]
+            ),
+            WorkspaceStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn with_no_sessions_the_cut_status_stands() {
+        assert_eq!(
+            roll_up_status(WorkspaceStatus::Idle, &[]),
+            WorkspaceStatus::Idle
+        );
+        assert_eq!(
+            roll_up_status(WorkspaceStatus::Working, &[]),
+            WorkspaceStatus::Working
+        );
+    }
+
+    #[test]
+    fn rollup_follows_blocked_then_working_then_done_then_idle() {
+        // any blocked wins
+        assert_eq!(
+            roll_up_status(
+                WorkspaceStatus::Idle,
+                &[
+                    WorkspaceStatus::Working,
+                    WorkspaceStatus::Blocked,
+                    WorkspaceStatus::Done
+                ]
+            ),
+            WorkspaceStatus::Blocked
+        );
+        // else any working wins
+        assert_eq!(
+            roll_up_status(
+                WorkspaceStatus::Idle,
+                &[WorkspaceStatus::Idle, WorkspaceStatus::Working]
+            ),
+            WorkspaceStatus::Working
+        );
+        // else all done -> done
+        assert_eq!(
+            roll_up_status(
+                WorkspaceStatus::Idle,
+                &[WorkspaceStatus::Done, WorkspaceStatus::Done]
+            ),
+            WorkspaceStatus::Done
+        );
+        // else (some idle) -> idle
+        assert_eq!(
+            roll_up_status(
+                WorkspaceStatus::Done,
+                &[WorkspaceStatus::Done, WorkspaceStatus::Idle]
+            ),
+            WorkspaceStatus::Idle
+        );
     }
 }
