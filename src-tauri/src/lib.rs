@@ -1,6 +1,6 @@
 pub mod modules;
 
-use modules::{agent, fs, git, history, net, pty, secrets, shell, workspace};
+use modules::{agent, fs, git, history, net, pty, registry, secrets, shell, workspace};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 #[cfg(target_os = "macos")]
@@ -136,12 +136,17 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
-        .setup(|_app| {
+        .setup(|app| {
+            // Helmsmen registry: single versioned JSON in app-data, atomic
+            // writes (HELMSMEN integration point — see docs/fork-posture.md).
+            let helmsmen_dir = app.path().app_data_dir()?.join("helmsmen");
+            app.manage(registry::RegistryState::load(helmsmen_dir));
+
             // macOS skips parent() for the settings window, so tie its lifecycle
             // to the main window here instead. Other platforms keep parent().
             #[cfg(target_os = "macos")]
-            if let Some(main) = _app.get_webview_window("main") {
-                let handle = _app.handle().clone();
+            if let Some(main) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
                 main.on_window_event(move |event| {
                     if matches!(
                         event,
@@ -243,6 +248,9 @@ pub fn run() {
             history::history_commands,
             history::history_record,
             history::history_list,
+            registry::commands::helm_detect_project,
+            registry::commands::helm_add_project,
+            registry::commands::helm_list_projects,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
