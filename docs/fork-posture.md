@@ -55,7 +55,8 @@ not listed is upstream's territory.
   backend modules (`core`, `registry`, `runtime`, `harness`; later `hooks`).
 - `src-tauri/src/lib.rs` — registration only: manage
   `registry::RegistryState` in `.setup()`, manage `runtime::RuntimeState`,
-  and list the `helm_*` commands in `invoke_handler` (tasks #4, #5, #6).
+  and list the `helm_*` commands in `invoke_handler` (tasks #4, #5, #6;
+  #7 adds the Project-settings/Profile commands to the same list).
 - `src/main.tsx` — install the Helm dev console (`window.helmsmen`,
   task #4); later the Helm surface registration.
 - _Still expected during M1+ (tracked in issue #2):_ settings schema (Terax

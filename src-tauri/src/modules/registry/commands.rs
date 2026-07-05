@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use tauri::State;
 
+use crate::modules::core::profile::Profile;
 use crate::modules::core::project::{repo_name, Project};
+use crate::modules::core::settings::ProjectSettings;
 use crate::modules::core::state::Event;
 use crate::modules::core::workspace::Workspace;
 use crate::modules::workspace::WorkspaceRegistry;
@@ -63,6 +65,9 @@ pub fn helm_add_project(
         base_branch: input.base_branch,
         worktree_home: input.worktree_home,
         branch_template: input.branch_template,
+        // Settings start empty and are edited afterwards; Profiles are
+        // seeded by the pure core when this event is applied.
+        settings: Default::default(),
     };
     let added = project.clone();
     registry.commit(Event::ProjectAdded { project })?;
@@ -73,6 +78,74 @@ pub fn helm_add_project(
 #[tauri::command]
 pub fn helm_list_projects(registry: State<'_, RegistryState>) -> Result<Vec<Project>, String> {
     Ok(registry.snapshot()?.projects)
+}
+
+/// Replace a Project's settings: setup script, carry-over globs, Process
+/// definitions. Definitions only at this slice — nothing is executed
+/// here (the cut pipeline runs them, task #8). The pure core validates
+/// every field; storage is Helmsmen's registry, never a file in the repo.
+#[tauri::command]
+pub fn helm_update_project_settings(
+    registry: State<'_, RegistryState>,
+    project_id: String,
+    settings: ProjectSettings,
+) -> Result<Project, String> {
+    update_project_settings(&registry, project_id, settings)
+}
+
+pub(crate) fn update_project_settings(
+    registry: &RegistryState,
+    project_id: String,
+    settings: ProjectSettings,
+) -> Result<Project, String> {
+    let next = registry.commit(Event::ProjectSettingsUpdated {
+        project_id: project_id.clone(),
+        settings,
+    })?;
+    next.projects
+        .into_iter()
+        .find(|p| p.id == project_id)
+        .ok_or_else(|| format!("no project with id {project_id:?}"))
+}
+
+/// List Profiles — all of them, or one Project's seeded copies.
+#[tauri::command]
+pub fn helm_list_profiles(
+    registry: State<'_, RegistryState>,
+    project_id: Option<String>,
+) -> Result<Vec<Profile>, String> {
+    let profiles = registry.snapshot()?.profiles;
+    Ok(match project_id {
+        Some(id) => profiles.into_iter().filter(|p| p.project_id == id).collect(),
+        None => profiles,
+    })
+}
+
+/// Edit a Project-owned Profile (full replacement by id). Divergence is
+/// per Project by construction: the event can only touch one Profile row
+/// and the core pins its `project_id`.
+#[tauri::command]
+pub fn helm_update_profile(
+    registry: State<'_, RegistryState>,
+    profile: Profile,
+) -> Result<Profile, String> {
+    update_profile(&registry, profile)
+}
+
+pub(crate) fn update_profile(
+    registry: &RegistryState,
+    profile: Profile,
+) -> Result<Profile, String> {
+    // Boundary check at the seam: the referenced Harness must exist in
+    // code. The pure core validates only the shape (exactly one
+    // non-empty id) so it stays independent of the harness layer.
+    if crate::modules::harness::by_id(&profile.harness_id).is_none() {
+        return Err(format!("unknown harness {:?}", profile.harness_id));
+    }
+    registry.commit(Event::ProfileUpdated {
+        profile: profile.clone(),
+    })?;
+    Ok(profile)
 }
 
 /// The cut form payload: which Project, and the slug that fills the
@@ -139,7 +212,7 @@ fn next_project_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::next_project_id;
+    use super::*;
 
     #[test]
     fn project_ids_are_unique_within_a_process() {
@@ -147,5 +220,68 @@ mod tests {
         let b = next_project_id();
         assert_ne!(a, b);
         assert!(a.starts_with("prj-"));
+    }
+
+    // --- task #7: the settings/Profile seam over a real registry ---
+
+    fn seeded_registry() -> (tempfile::TempDir, RegistryState) {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = RegistryState::load(dir.path().join("helmsmen"));
+        reg.commit(Event::ProjectAdded {
+            project: Project {
+                id: "prj-1".to_string(),
+                name: "demo".to_string(),
+                repo_root: "/home/dev/src/demo".to_string(),
+                base_branch: "main".to_string(),
+                worktree_home: "/home/dev/.helmsmen/worktrees/demo".to_string(),
+                branch_template: "helm/{slug}".to_string(),
+                settings: Default::default(),
+            },
+        })
+        .unwrap();
+        (dir, reg)
+    }
+
+    #[test]
+    fn update_project_settings_returns_the_updated_project() {
+        let (_dir, reg) = seeded_registry();
+        let settings = ProjectSettings {
+            setup_script: "make setup".to_string(),
+            carry_over_globs: vec![".env*".to_string()],
+            processes: vec![],
+        };
+        let project =
+            update_project_settings(&reg, "prj-1".to_string(), settings.clone()).unwrap();
+        assert_eq!(project.settings, settings);
+        assert_eq!(reg.snapshot().unwrap().projects[0].settings, settings);
+    }
+
+    #[test]
+    fn update_profile_rejects_an_unknown_harness_at_the_seam() {
+        let (_dir, reg) = seeded_registry();
+        let mut profile = reg.snapshot().unwrap().profiles[0].clone();
+        // Shape-valid for the pure core, but no such Harness exists in
+        // code — the seam must refuse before anything is committed.
+        profile.harness_id = "ghost-harness".to_string();
+        let err = update_profile(&reg, profile).unwrap_err();
+        assert!(err.contains("ghost-harness"), "unexpected error: {err}");
+        assert!(reg
+            .snapshot()
+            .unwrap()
+            .profiles
+            .iter()
+            .all(|p| p.harness_id == "claude-code"));
+    }
+
+    #[test]
+    fn update_profile_commits_a_registered_harness_edit() {
+        let (_dir, reg) = seeded_registry();
+        let mut profile = reg.snapshot().unwrap().profiles[0].clone();
+        profile.verify_command = "pnpm test".to_string();
+        let updated = update_profile(&reg, profile.clone()).unwrap();
+        assert_eq!(updated, profile);
+        let stored = reg.snapshot().unwrap();
+        let got = stored.profiles.iter().find(|p| p.id == profile.id).unwrap();
+        assert_eq!(got.verify_command, "pnpm test");
     }
 }

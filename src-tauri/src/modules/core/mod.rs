@@ -7,6 +7,8 @@
 //! persistence, git detection, Tauri command glue — lives in
 //! `modules::registry` and stays thin.
 
+pub mod profile;
 pub mod project;
+pub mod settings;
 pub mod state;
 pub mod workspace;

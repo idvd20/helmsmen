@@ -107,6 +107,21 @@ mod tests {
         assert!(by_id("").is_none());
     }
 
+    /// The pure core's built-in Profile templates reference Harnesses by
+    /// id without importing this layer; this pins the ids to reality so
+    /// a renamed Harness cannot silently orphan every seeded Profile.
+    #[test]
+    fn builtin_profile_templates_reference_registered_harnesses() {
+        for template in crate::modules::core::profile::BUILTIN_TEMPLATES {
+            assert!(
+                by_id(template.harness_id).is_some(),
+                "profile template {:?} references unknown harness {:?}",
+                template.id,
+                template.harness_id
+            );
+        }
+    }
+
     #[test]
     fn every_registered_harness_has_a_unique_nonempty_id() {
         let mut ids: Vec<&str> = all().iter().map(|h| h.id()).collect();

@@ -293,6 +293,7 @@ mod tests {
                     base_branch: "main".to_string(),
                     worktree_home: worktree_home.clone(),
                     branch_template: branch_template.to_string(),
+                    settings: Default::default(),
                 },
             })
             .unwrap();
@@ -497,6 +498,7 @@ mod tests {
                 base_branch: "no-such-branch".to_string(),
                 worktree_home: f.worktree_home.clone(),
                 branch_template: "helm/{slug}".to_string(),
+                settings: Default::default(),
             };
             // Same repo root is rejected by the core, so use a second repo.
             let tmp2 = tempfile::tempdir().unwrap();

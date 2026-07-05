@@ -7,7 +7,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::profile::{validate_profile, Profile};
 use super::project::Project;
+use super::settings::{validate_settings, ProjectSettings};
 use super::workspace::{lowest_free_slot, validate_workspace, Workspace};
 
 /// Whole-registry pure state. Serialized inside a versioned envelope by
@@ -20,6 +22,10 @@ pub struct CoreState {
     /// Live Workspaces across all Projects (removed on land/scuttle).
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
+    /// Project-owned Profiles, seeded from the built-in templates when
+    /// their Project is added (task #7).
+    #[serde(default)]
+    pub profiles: Vec<Profile>,
 }
 
 /// Every mutation of Helmsmen state is an Event fed through [`apply`].
@@ -32,6 +38,15 @@ pub enum Event {
     /// A Workspace was removed (worktree + branch already cleaned up by
     /// the shell). Frees its Slot implicitly.
     WorkspaceRemoved { workspace_id: String },
+    /// The whole per-Project settings blob was replaced (form-submit
+    /// semantics). Definitions only — nothing runs here.
+    ProjectSettingsUpdated {
+        project_id: String,
+        settings: ProjectSettings,
+    },
+    /// A Project-owned Profile was edited (full replacement by id). The
+    /// Profile can never move to another Project.
+    ProfileUpdated { profile: Profile },
 }
 
 /// Pure, serializable transition errors.
@@ -53,6 +68,8 @@ pub enum CoreError {
     /// The Slot rule: a cut must carry the lowest free integer among the
     /// Project's live Workspaces.
     SlotNotLowestFree { expected: u32, got: u32 },
+    UnknownProfile(String),
+    DuplicateProfileId(String),
 }
 
 impl fmt::Display for CoreError {
@@ -80,6 +97,10 @@ impl fmt::Display for CoreError {
                 f,
                 "slot {got} is not the lowest free slot (expected {expected})"
             ),
+            CoreError::UnknownProfile(id) => write!(f, "no profile with id {id:?}"),
+            CoreError::DuplicateProfileId(id) => {
+                write!(f, "a profile with id {id:?} already exists")
+            }
         }
     }
 }
@@ -103,8 +124,20 @@ pub fn apply(state: CoreState, event: Event) -> Result<CoreState, CoreError> {
             {
                 return Err(CoreError::DuplicateRepoRoot(project.repo_root));
             }
+            // Seed Project-owned Profile copies from the built-in
+            // templates (task #7). Deterministic ids, validated like any
+            // other entity; a collision (possible only in a hand-edited
+            // registry file) rejects the whole event.
+            let seeded = super::profile::seed_profiles(&project.id);
+            for profile in &seeded {
+                validate_profile(profile)?;
+                if state.profiles.iter().any(|p| p.id == profile.id) {
+                    return Err(CoreError::DuplicateProfileId(profile.id.clone()));
+                }
+            }
             let mut next = state;
             next.projects.push(project);
+            next.profiles.extend(seeded);
             Ok(next)
         }
         Event::WorkspaceCut { workspace } => {
@@ -148,14 +181,65 @@ pub fn apply(state: CoreState, event: Event) -> Result<CoreState, CoreError> {
             next.workspaces.retain(|w| w.id != workspace_id);
             Ok(next)
         }
+        Event::ProjectSettingsUpdated {
+            project_id,
+            settings,
+        } => {
+            validate_settings(&settings)?;
+            let mut next = state;
+            let project = next
+                .projects
+                .iter_mut()
+                .find(|p| p.id == project_id)
+                .ok_or(CoreError::UnknownProject(project_id))?;
+            project.settings = settings;
+            Ok(next)
+        }
+        Event::ProfileUpdated { profile } => {
+            validate_profile(&profile)?;
+            let existing = state
+                .profiles
+                .iter()
+                .find(|p| p.id == profile.id)
+                .ok_or_else(|| CoreError::UnknownProfile(profile.id.clone()))?;
+            // Ownership is immutable: divergence stays inside one Project.
+            if existing.project_id != profile.project_id {
+                return Err(CoreError::Invalid {
+                    field: "projectId",
+                    reason: "a profile cannot move to another project".to_string(),
+                });
+            }
+            // Names stay unique within the Project (pick lists key on them).
+            if state.profiles.iter().any(|p| {
+                p.project_id == profile.project_id && p.id != profile.id && p.name == profile.name
+            }) {
+                return Err(CoreError::Invalid {
+                    field: "name",
+                    reason: format!(
+                        "another profile in this project is already named {:?}",
+                        profile.name
+                    ),
+                });
+            }
+            let mut next = state;
+            let slot = next
+                .profiles
+                .iter_mut()
+                .find(|p| p.id == profile.id)
+                .expect("existence checked above");
+            *slot = profile;
+            Ok(next)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::profile::seed_profiles;
     use super::super::project::{
         prefill, repo_name, validate_branch_template, validate_ref_name, DEFAULT_BRANCH_TEMPLATE,
     };
+    use super::super::settings::ProcessDef;
     use super::*;
 
     fn project(id: &str, repo_root: &str) -> Project {
@@ -166,6 +250,7 @@ mod tests {
             base_branch: "main".to_string(),
             worktree_home: "/home/dev/.helmsmen/worktrees/helmsmen".to_string(),
             branch_template: DEFAULT_BRANCH_TEMPLATE.to_string(),
+            settings: ProjectSettings::default(),
         }
     }
 
@@ -623,6 +708,254 @@ mod tests {
         // Files written by the task-#4 build have no `workspaces` key.
         let s: CoreState = serde_json::from_str(r#"{ "projects": [] }"#).unwrap();
         assert_eq!(s, CoreState::default());
+    }
+
+    // --- apply: Profile seeding + divergence (task #7) ---
+
+    #[test]
+    fn project_added_seeds_the_five_builtin_profiles() {
+        let s = state_with_project("prj-1");
+        let names: Vec<&str> = s.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Feature", "Bugfix", "Research", "Spike", "Reviewer"]);
+        assert!(s.profiles.iter().all(|p| p.project_id == "prj-1"));
+        assert_eq!(s.profiles, seed_profiles("prj-1"));
+    }
+
+    #[test]
+    fn each_project_gets_its_own_seeded_copies() {
+        let s = apply(
+            state_with_project("prj-1"),
+            Event::ProjectAdded {
+                project: project("prj-2", "/home/dev/src/prj-2"),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.profiles.len(), 10);
+        let mut ids: Vec<&String> = s.profiles.iter().map(|p| &p.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 10, "profile ids must be unique across projects");
+        for prj in ["prj-1", "prj-2"] {
+            assert_eq!(s.profiles.iter().filter(|p| p.project_id == prj).count(), 5);
+        }
+    }
+
+    fn seeded_two_projects() -> CoreState {
+        apply(
+            state_with_project("prj-1"),
+            Event::ProjectAdded {
+                project: project("prj-2", "/home/dev/src/prj-2"),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn editing_a_seeded_profile_touches_only_that_project() {
+        let s = seeded_two_projects();
+        let mut edited = s
+            .profiles
+            .iter()
+            .find(|p| p.project_id == "prj-1" && p.name == "Feature")
+            .unwrap()
+            .clone();
+        edited.prompt_snippet = "/tdd {brief} — repo-specific tweak".to_string();
+        edited.verify_command = "pnpm test && cargo test".to_string();
+        edited.model = "claude-opus-4-6".to_string();
+        edited.mcp_servers = vec!["playwright".to_string()];
+        edited.color = "#123abc".to_string();
+
+        let next = apply(
+            s,
+            Event::ProfileUpdated {
+                profile: edited.clone(),
+            },
+        )
+        .unwrap();
+
+        // The edited Profile carries every field of the full set.
+        let got = next.profiles.iter().find(|p| p.id == edited.id).unwrap();
+        assert_eq!(got, &edited);
+
+        // Divergence is isolated: prj-2's seeds and prj-1's other seeds
+        // are untouched, and the templates re-seed unchanged.
+        let untouched: Vec<&Profile> = next
+            .profiles
+            .iter()
+            .filter(|p| p.id != edited.id)
+            .collect();
+        let expected: Vec<Profile> = seed_profiles("prj-1")
+            .into_iter()
+            .chain(seed_profiles("prj-2"))
+            .filter(|p| p.id != edited.id)
+            .collect();
+        assert_eq!(untouched.len(), 9);
+        for (got, want) in untouched.iter().zip(expected.iter()) {
+            assert_eq!(*got, want);
+        }
+    }
+
+    #[test]
+    fn profile_updated_rejects_unknown_profile() {
+        let s = state_with_project("prj-1");
+        let mut ghost = seed_profiles("prj-1").remove(0);
+        ghost.id = "prj-1:ghost".to_string();
+        let err = apply(s, Event::ProfileUpdated { profile: ghost }).unwrap_err();
+        assert_eq!(err, CoreError::UnknownProfile("prj-1:ghost".to_string()));
+    }
+
+    #[test]
+    fn profile_cannot_move_to_another_project() {
+        let s = seeded_two_projects();
+        let mut stolen = s
+            .profiles
+            .iter()
+            .find(|p| p.project_id == "prj-1")
+            .unwrap()
+            .clone();
+        stolen.project_id = "prj-2".to_string();
+        let err = apply(s, Event::ProfileUpdated { profile: stolen }).unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::Invalid {
+                field: "projectId",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_names_stay_unique_within_a_project() {
+        let s = seeded_two_projects();
+        let mut renamed = s
+            .profiles
+            .iter()
+            .find(|p| p.project_id == "prj-1" && p.name == "Bugfix")
+            .unwrap()
+            .clone();
+        renamed.name = "Feature".to_string();
+        let err = apply(
+            s.clone(),
+            Event::ProfileUpdated {
+                profile: renamed.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid { field: "name", .. }));
+        // The same name in *another* Project is fine (all seeds share
+        // names across Projects already); renaming to itself is fine too.
+        renamed.name = "Bugfix".to_string();
+        apply(s, Event::ProfileUpdated { profile: renamed }).unwrap();
+    }
+
+    #[test]
+    fn profile_updated_rejects_invalid_fields() {
+        let s = state_with_project("prj-1");
+        let mut bad = s.profiles[0].clone();
+        bad.color = "not-a-color".to_string();
+        let err = apply(s, Event::ProfileUpdated { profile: bad }).unwrap_err();
+        assert!(matches!(err, CoreError::Invalid { field: "color", .. }));
+    }
+
+    // --- apply: ProjectSettingsUpdated (task #7) ---
+
+    fn demo_settings() -> ProjectSettings {
+        ProjectSettings {
+            setup_script: "pnpm install --frozen-lockfile\ncp .env.example .env".to_string(),
+            carry_over_globs: vec![".env*".to_string()],
+            processes: vec![ProcessDef {
+                name: "dev".to_string(),
+                command: "pnpm dev".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn project_settings_updated_replaces_the_settings() {
+        let s = seeded_two_projects();
+        let next = apply(
+            s,
+            Event::ProjectSettingsUpdated {
+                project_id: "prj-1".to_string(),
+                settings: demo_settings(),
+            },
+        )
+        .unwrap();
+        let one = next.projects.iter().find(|p| p.id == "prj-1").unwrap();
+        assert_eq!(one.settings, demo_settings());
+        // Other Projects keep their own settings.
+        let two = next.projects.iter().find(|p| p.id == "prj-2").unwrap();
+        assert_eq!(two.settings, ProjectSettings::default());
+    }
+
+    #[test]
+    fn project_settings_updated_rejects_unknown_project() {
+        let err = apply(
+            state_with_project("prj-1"),
+            Event::ProjectSettingsUpdated {
+                project_id: "prj-ghost".to_string(),
+                settings: demo_settings(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CoreError::UnknownProject("prj-ghost".to_string()));
+    }
+
+    #[test]
+    fn project_settings_updated_rejects_hostile_globs() {
+        let mut settings = demo_settings();
+        settings.carry_over_globs = vec!["../outside/.env".to_string()];
+        let err = apply(
+            state_with_project("prj-1"),
+            Event::ProjectSettingsUpdated {
+                project_id: "prj-1".to_string(),
+                settings,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::Invalid {
+                field: "carryOverGlobs",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn registry_files_without_profiles_or_settings_still_deserialize() {
+        // Files written by pre-#7 builds have neither `profiles` nor a
+        // `settings` key on projects.
+        let s: CoreState = serde_json::from_str(
+            r#"{
+                "projects": [{
+                    "id": "prj-old",
+                    "name": "demo",
+                    "repoRoot": "/home/dev/src/demo",
+                    "baseBranch": "main",
+                    "worktreeHome": "/home/dev/.helmsmen/worktrees/demo",
+                    "branchTemplate": "helm/{slug}"
+                }],
+                "workspaces": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(s.projects[0].settings, ProjectSettings::default());
+        assert!(s.profiles.is_empty());
+    }
+
+    #[test]
+    fn profiles_and_settings_round_trip_through_json() {
+        let s = apply(
+            state_with_project("prj-1"),
+            Event::ProjectSettingsUpdated {
+                project_id: "prj-1".to_string(),
+                settings: demo_settings(),
+            },
+        )
+        .unwrap();
+        let back: CoreState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 
     // --- serialization shape (locks the registry JSON contract) ---
