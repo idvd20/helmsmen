@@ -153,6 +153,7 @@ fn write_registry_atomic(path: &Path, state: &CoreState) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::modules::core::project::{Project, DEFAULT_BRANCH_TEMPLATE};
+    use crate::modules::core::settings::{ProcessDef, ProjectSettings};
 
     fn project(id: &str, repo_root: &str) -> Project {
         Project {
@@ -162,6 +163,7 @@ mod tests {
             base_branch: "main".to_string(),
             worktree_home: "/home/dev/.helmsmen/worktrees/demo".to_string(),
             branch_template: DEFAULT_BRANCH_TEMPLATE.to_string(),
+            settings: Default::default(),
         }
     }
 
@@ -265,6 +267,114 @@ mod tests {
         assert!(reg.commit(added("prj-2", "/home/dev/src/demo")).is_err());
         assert_eq!(reg.snapshot().unwrap().projects.len(), 1);
         assert_eq!(std::fs::read(home.join(REGISTRY_FILE)).unwrap(), before);
+    }
+
+    // --- task #7: Project settings + Profiles are registry-only state ---
+
+    fn demo_settings() -> ProjectSettings {
+        ProjectSettings {
+            setup_script: "pnpm install --frozen-lockfile".to_string(),
+            carry_over_globs: vec![".env*".to_string()],
+            processes: vec![ProcessDef {
+                name: "dev".to_string(),
+                command: "pnpm dev".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn settings_and_profiles_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("helmsmen");
+
+        let reg = RegistryState::load(home.clone());
+        reg.commit(added("prj-1", "/home/dev/src/demo")).unwrap();
+        reg.commit(Event::ProjectSettingsUpdated {
+            project_id: "prj-1".to_string(),
+            settings: demo_settings(),
+        })
+        .unwrap();
+        let mut profile = reg.snapshot().unwrap().profiles[0].clone();
+        profile.verify_command = "cargo test".to_string();
+        reg.commit(Event::ProfileUpdated {
+            profile: profile.clone(),
+        })
+        .unwrap();
+        drop(reg);
+
+        // "Restart": a brand-new RegistryState over the same directory.
+        let state = RegistryState::load(home).snapshot().unwrap();
+        assert_eq!(state.projects[0].settings, demo_settings());
+        assert_eq!(state.profiles.len(), 5, "seeds must persist");
+        assert_eq!(state.profiles[0], profile, "the edit must persist");
+    }
+
+    #[test]
+    fn settings_and_profiles_live_only_in_the_registry_file() {
+        // The single place these settings are stored is registry.json in
+        // app-data — never a file inside the repo (a repo must not be
+        // able to configure its own trust).
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("helmsmen");
+        let reg = RegistryState::load(home.clone());
+        reg.commit(added("prj-1", "/home/dev/src/demo")).unwrap();
+        reg.commit(Event::ProjectSettingsUpdated {
+            project_id: "prj-1".to_string(),
+            settings: demo_settings(),
+        })
+        .unwrap();
+
+        let raw = std::fs::read_to_string(home.join(REGISTRY_FILE)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let project = &json["state"]["projects"][0];
+        assert_eq!(
+            project["settings"]["setupScript"],
+            "pnpm install --frozen-lockfile"
+        );
+        assert_eq!(project["settings"]["carryOverGlobs"][0], ".env*");
+        assert_eq!(project["settings"]["processes"][0]["name"], "dev");
+        assert_eq!(json["state"]["profiles"].as_array().unwrap().len(), 5);
+        // And the registry file is still the only file written.
+        let entries: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec![REGISTRY_FILE.to_string()]);
+    }
+
+    #[test]
+    fn pre_task7_registry_file_loads_and_stays_editable() {
+        // A v1 file written before task #7: no `settings` on projects, no
+        // `profiles` key. It must keep loading (additive fields only) and
+        // accept new events.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("helmsmen");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(REGISTRY_FILE),
+            br#"{ "version": 1, "state": { "projects": [{
+                "id": "prj-old",
+                "name": "demo",
+                "repoRoot": "/home/dev/src/demo",
+                "baseBranch": "main",
+                "worktreeHome": "/home/dev/.helmsmen/worktrees/demo",
+                "branchTemplate": "helm/{slug}"
+            }], "workspaces": [] } }"#,
+        )
+        .unwrap();
+
+        let reg = RegistryState::load(home);
+        let state = reg.snapshot().unwrap();
+        assert_eq!(state.projects[0].settings, ProjectSettings::default());
+        assert!(state.profiles.is_empty());
+
+        let next = reg
+            .commit(Event::ProjectSettingsUpdated {
+                project_id: "prj-old".to_string(),
+                settings: demo_settings(),
+            })
+            .unwrap();
+        assert_eq!(next.projects[0].settings, demo_settings());
     }
 
     /// Architecture guard for the PRD's functional-core rule: the pure core

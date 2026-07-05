@@ -180,6 +180,7 @@ mod tests {
                     base_branch: "main".to_string(),
                     worktree_home: crate::modules::fs::to_canon(tmp.path().join("wt")),
                     branch_template: "helm/{slug}".to_string(),
+                    settings: Default::default(),
                 },
             })
             .unwrap();

@@ -16,6 +16,17 @@
 //   await helmsmen.listHarnesses()                          // Caps, from code
 //   await helmsmen.removeWorkspace(workspace.id)
 //
+// Project settings + Profiles (task #7 — definitions only; the cut
+// pipeline of task #8 executes them):
+//
+//   await helmsmen.updateProjectSettings(p.id, {
+//     setupScript: "pnpm install",
+//     carryOverGlobs: [".env*"],
+//     processes: [{ name: "dev", command: "pnpm dev" }],
+//   })
+//   const [feature] = await helmsmen.listProfiles(p.id)     // seeded copies
+//   await helmsmen.updateProfile({ ...feature, verifyCommand: "pnpm test" })
+//
 // Thin by design: every call goes straight to the Tauri commands, which
 // validate at the boundary and in the pure core. The frontend never
 // spawns processes, runs git, or touches repo files; session output is

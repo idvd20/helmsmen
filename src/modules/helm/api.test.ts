@@ -5,8 +5,10 @@ import {
   type HelmAgentSession,
   type HelmCutWorkspace,
   type HelmHarness,
+  type HelmProfile,
   type HelmProject,
   type HelmProjectDetection,
+  type HelmProjectSettings,
   type InvokeFn,
 } from "./api";
 
@@ -24,7 +26,17 @@ const detection: HelmProjectDetection = {
   branchTemplate: "helm/{slug}",
 };
 
-const project: HelmProject = { id: "prj-1", ...detection };
+const emptySettings: HelmProjectSettings = {
+  setupScript: "",
+  carryOverGlobs: [],
+  processes: [],
+};
+
+const project: HelmProject = {
+  id: "prj-1",
+  ...detection,
+  settings: emptySettings,
+};
 
 // Locks the frontend seam of task #5 (M1: cut a worktree): cut / remove /
 // list / env talk to exactly these Tauri commands with exactly these
@@ -188,6 +200,76 @@ describe("createHelmApi", () => {
         },
       },
     ]);
+  });
+});
+
+// Locks the frontend seam of task #7 (M2: Project settings + Profiles):
+// settings and Profiles are edited through exactly these Tauri commands
+// — the frontend never writes a file, and nothing is executed at this
+// slice (definitions only; the cut pipeline of task #8 runs them).
+// Seeding, divergence isolation, and validation are covered by the Rust
+// tests in src-tauri/src/modules/{core,registry}.
+
+const settings: HelmProjectSettings = {
+  setupScript: "pnpm install --frozen-lockfile\ncp .env.example .env",
+  carryOverGlobs: [".env*"],
+  processes: [{ name: "dev", command: "pnpm dev" }],
+};
+
+const profile: HelmProfile = {
+  id: "prj-1:feature",
+  projectId: "prj-1",
+  name: "Feature",
+  promptSnippet: "/tdd {brief}",
+  model: "",
+  mcpServers: [],
+  verifyCommand: "",
+  color: "#3b82f6",
+  harnessId: "claude-code",
+};
+
+describe("createHelmApi project settings and profiles", () => {
+  it("updateProjectSettings sends the whole settings blob for one project", async () => {
+    const updated: HelmProject = { ...project, settings };
+    const { invoke, calls } = fakeInvoke({
+      helm_update_project_settings: updated,
+    });
+    const api = createHelmApi(invoke);
+    await expect(
+      api.updateProjectSettings("prj-1", settings),
+    ).resolves.toEqual(updated);
+    expect(calls).toEqual([
+      ["helm_update_project_settings", { projectId: "prj-1", settings }],
+    ]);
+  });
+
+  it("listProfiles asks for one project's seeded copies", async () => {
+    const { invoke, calls } = fakeInvoke({ helm_list_profiles: [profile] });
+    const api = createHelmApi(invoke);
+    await expect(api.listProfiles("prj-1")).resolves.toEqual([profile]);
+    expect(calls).toEqual([["helm_list_profiles", { projectId: "prj-1" }]]);
+  });
+
+  it("listProfiles without a project lists everything", async () => {
+    const { invoke, calls } = fakeInvoke({ helm_list_profiles: [profile] });
+    const api = createHelmApi(invoke);
+    await api.listProfiles();
+    expect(calls).toEqual([["helm_list_profiles", { projectId: undefined }]]);
+  });
+
+  it("updateProfile sends the full profile — every field of the set", async () => {
+    const edited: HelmProfile = {
+      ...profile,
+      promptSnippet: "/tdd {brief} — keep commits small",
+      model: "claude-opus-4-6",
+      mcpServers: ["playwright"],
+      verifyCommand: "pnpm test",
+      color: "#123abc",
+    };
+    const { invoke, calls } = fakeInvoke({ helm_update_profile: edited });
+    const api = createHelmApi(invoke);
+    await expect(api.updateProfile(edited)).resolves.toEqual(edited);
+    expect(calls).toEqual([["helm_update_profile", { profile: edited }]]);
   });
 });
 

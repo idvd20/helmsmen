@@ -9,6 +9,7 @@ use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
+use super::settings::{validate_settings, ProjectSettings};
 use super::state::CoreError;
 
 /// Default branch template offered when a Project is added. `{slug}` is
@@ -35,6 +36,10 @@ pub struct Project {
     pub worktree_home: String,
     /// Branch-name template for cut Workspaces (prefilled, editable).
     pub branch_template: String,
+    /// Per-Project settings (setup script, carry-over globs, Processes).
+    /// Additive with a default so pre-#7 registry files keep loading.
+    #[serde(default)]
+    pub settings: ProjectSettings,
 }
 
 /// Prefill values computed for the add-Project form. Pure: derived only
@@ -94,6 +99,7 @@ pub fn validate_project(project: &Project) -> Result<(), CoreError> {
     validate_abs_path("worktreeHome", &project.worktree_home)?;
     validate_ref_name("baseBranch", &project.base_branch)?;
     validate_branch_template("branchTemplate", &project.branch_template)?;
+    validate_settings(&project.settings)?;
     Ok(())
 }
 

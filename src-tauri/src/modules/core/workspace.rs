@@ -168,6 +168,7 @@ mod tests {
             base_branch: "main".to_string(),
             worktree_home: "/home/dev/.helmsmen/worktrees/helmsmen".to_string(),
             branch_template: "helm/{slug}".to_string(),
+            settings: Default::default(),
         }
     }
 

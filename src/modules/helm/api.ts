@@ -5,6 +5,26 @@
 // no import-time Tauri dependency and is unit-testable without a webview.
 // All real validation happens in the backend (boundary + pure core).
 
+/** One named long-lived command (dev server etc.), startable as a
+ * Process Session inside any Workspace of its Project. Definition only:
+ * nothing runs until the cut pipeline / zoom view spawns it. */
+export interface HelmProcessDef {
+  name: string;
+  command: string;
+}
+
+/** Per-Project settings, stored user-level in Helmsmen's registry only —
+ * never read from a file inside the repo. */
+export interface HelmProjectSettings {
+  /** One multiline shell command run in every fresh worktree (user's
+   * shell, cwd = worktree). Empty = none. */
+  setupScript: string;
+  /** Globs of untracked files (`.env*` etc.) copied from the main
+   * checkout into each fresh worktree. */
+  carryOverGlobs: string[];
+  processes: HelmProcessDef[];
+}
+
 export interface HelmProject {
   id: string;
   name: string;
@@ -12,6 +32,30 @@ export interface HelmProject {
   baseBranch: string;
   worktreeHome: string;
   branchTemplate: string;
+  settings: HelmProjectSettings;
+}
+
+/** A Project-owned launch config for one Session, seeded as a copy of
+ * one of the five built-in templates (Feature, Bugfix, Research, Spike,
+ * Reviewer) at Project-add. Edits diverge freely inside the Project. */
+export interface HelmProfile {
+  id: string;
+  projectId: string;
+  name: string;
+  /** Wrapped around the Brief as the opening prompt; `{brief}` marks
+   * where the Brief goes. */
+  promptSnippet: string;
+  /** Harness-specific model name; empty = the Harness default. */
+  model: string;
+  /** MCP set composed into the worktree's MCP config at spawn (M6). */
+  mcpServers: string[];
+  /** Check command run in the worktree on demand or on Stop; empty =
+   * no verify. */
+  verifyCommand: string;
+  /** `#rrggbb`; follows the Workspace everywhere in the UI. */
+  color: string;
+  /** Exactly one Harness, by its stable id (e.g. `"claude-code"`). */
+  harnessId: string;
 }
 
 /** Prefill computed by the backend for a picked clone; every field is
@@ -150,6 +194,27 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
   /** Every Harness with its in-code Cap set. */
   const listHarnesses = () => invoke<HelmHarness[]>("helm_list_harnesses");
 
+  /** Replace a Project's settings (setup script, carry-over globs,
+   * Process definitions). The backend validates every field and stores
+   * them in the registry only. */
+  const updateProjectSettings = (
+    projectId: string,
+    settings: HelmProjectSettings,
+  ) =>
+    invoke<HelmProject>("helm_update_project_settings", {
+      projectId,
+      settings,
+    });
+
+  /** Profiles — all of them, or one Project's seeded copies. */
+  const listProfiles = (projectId?: string) =>
+    invoke<HelmProfile[]>("helm_list_profiles", { projectId });
+
+  /** Edit a Project-owned Profile (full replacement by id). Divergence
+   * stays inside the Project; templates and other Projects never move. */
+  const updateProfile = (profile: HelmProfile) =>
+    invoke<HelmProfile>("helm_update_profile", { profile });
+
   const streamChannels = (handlers: AgentStreamHandlers) => {
     if (!makeChannel) {
       throw new Error("helm api was created without a channel factory");
@@ -238,6 +303,9 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
     listWorkspaces,
     workspaceEnv,
     listHarnesses,
+    updateProjectSettings,
+    listProfiles,
+    updateProfile,
     spawnAgent,
     attachAgent,
     writeAgent,
