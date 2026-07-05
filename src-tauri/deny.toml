@@ -1,0 +1,52 @@
+# cargo-deny gate (M0 CI gate; PRD security invariant: Apache-2.0 posture
+# matching Terax). Runs on every push/PR — see .github/workflows/ci.yml.
+#
+# Licenses are allowlisted: a dependency bump that introduces a new license
+# fails CI, making every extension of this list a deliberate decision.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+# Gate unmaintained-crate advisories on our direct dependencies only. On a
+# track-upstream fork, transitive unmaintained crates (GTK3 bindings, fxhash,
+# unic-*, proc-macro-error — all pulled in by the Tauri stack) are fixed by
+# upstream merges, not by us patching the lockfile.
+unmaintained = "workspace"
+# Advisories pre-existing on the unmodified fork's lockfile. Clearing them
+# needs dependency bumps (upstream's tree, not CI config); each entry is a
+# documented acceptance with a removal path. New advisories still fail CI.
+ignore = [
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37.5/0.38.4, transitive via the Tauri stack: quadratic duplicate-attribute check. DoS-only; no untrusted XML is parsed by this app's own code. Remove on the next upstream dependency bump." },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37.5/0.38.4, transitive via the Tauri stack: NsReader memory-exhaustion DoS. Same acceptance and removal path as RUSTSEC-2026-0194." },
+]
+
+[licenses]
+# Vetted as compatible with distributing Helmsmen under Apache-2.0.
+# - MPL-2.0: file-level weak copyleft; unavoidable in the core Tauri stack
+#   (cssparser/selectors/kuchikiki via wry/tauri-runtime). We do not modify
+#   MPL-licensed sources.
+# - CDLA-Permissive-2.0: Mozilla CA certificate data (webpki-roots).
+# - Unicode-3.0: ICU4X crates pulled in by the ecosystem.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate crate versions are endemic to a Tauri tree; not this gate's job.
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

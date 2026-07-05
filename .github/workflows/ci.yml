@@ -29,6 +29,12 @@ jobs:
         run: pnpm audit --prod --audit-level high
         continue-on-error: true
 
+      # M0 gate: JS dependency licenses must stay within the Apache-2.0
+      # posture (policy in scripts/check-licenses.mjs, locked by
+      # src/lib/licensePolicy.test.ts).
+      - name: License check
+        run: pnpm check-licenses
+
       - name: Lint
         run: pnpm lint
 
@@ -86,6 +92,12 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # SEAM(M1): compile-against-traits-not-concretes check lands here once
+      # M1 introduces the Runtime/Harness traits — a check-only build proving
+      # the imperative shell compiles against the trait seams, not concrete
+      # implementations (e.g. `cargo check` of a consumer target that imports
+      # only the traits). Deliberately absent until the traits exist.
+
       - name: Unused crates (advisory)
         working-directory: src-tauri
         run: cargo machete
@@ -94,6 +106,18 @@ jobs:
       - name: cargo nextest
         working-directory: src-tauri
         run: cargo nextest run --locked
+
+  # M0 gate: Rust dependency posture — license allowlist, RustSec advisories,
+  # and registry-source pinning. Policy lives in src-tauri/deny.toml.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: src-tauri/Cargo.toml
 
   rust-platforms:
     name: rust-test (${{ matrix.os }})
