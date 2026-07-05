@@ -32,6 +32,23 @@ export interface AddProjectInput {
   branchTemplate: string;
 }
 
+/** One task: one git worktree on its own branch under a Project. */
+export interface HelmWorkspace {
+  id: string;
+  projectId: string;
+  slug: string;
+  branch: string;
+  worktreePath: string;
+  slot: number;
+}
+
+/** What a cut returns: the live Workspace plus the assembled `HELMSMEN_*`
+ * env every later pipeline step spawns with. */
+export interface HelmCutWorkspace {
+  workspace: HelmWorkspace;
+  env: Record<string, string>;
+}
+
 export type InvokeFn = <T>(
   cmd: string,
   args?: Record<string, unknown>,
@@ -62,7 +79,35 @@ export function createHelmApi(invoke: InvokeFn) {
     });
   };
 
-  return { detectProject, addProject, listProjects, addProjectFromPath };
+  /** Cut a Workspace: worktree + branch off base with the branch
+   * template, Slot, workspace-root authorization, `HELMSMEN_*` env. */
+  const cutWorkspace = (projectId: string, slug: string) =>
+    invoke<HelmCutWorkspace>("helm_cut_workspace", {
+      input: { projectId, slug },
+    });
+
+  /** Remove a Workspace: delete worktree and branch, free the Slot. */
+  const removeWorkspace = (workspaceId: string) =>
+    invoke<void>("helm_remove_workspace", { workspaceId });
+
+  const listWorkspaces = () =>
+    invoke<HelmWorkspace[]>("helm_list_workspaces");
+
+  /** The `HELMSMEN_*` env assembled for everything spawned in the
+   * Workspace (setup script, Processes, Agent Sessions). */
+  const workspaceEnv = (workspaceId: string) =>
+    invoke<Record<string, string>>("helm_workspace_env", { workspaceId });
+
+  return {
+    detectProject,
+    addProject,
+    listProjects,
+    addProjectFromPath,
+    cutWorkspace,
+    removeWorkspace,
+    listWorkspaces,
+    workspaceEnv,
+  };
 }
 
 export type HelmApi = ReturnType<typeof createHelmApi>;

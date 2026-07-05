@@ -55,12 +55,16 @@ not listed is upstream's territory.
   backend modules (`core`, `registry`; later `runtime`, `harness`, `hooks`).
 - `src-tauri/src/lib.rs` — registration only: manage
   `registry::RegistryState` in `.setup()` and list the `helm_*` commands in
-  `invoke_handler` (task #4).
+  `invoke_handler` (tasks #4, #5).
 - `src/main.tsx` — install the Helm dev console (`window.helmsmen`,
   task #4); later the Helm surface registration.
 - _Still expected during M1+ (tracked in issue #2):_ settings schema (Terax
-  AI side-panel toggle), workspace-root authorization call site used by the
-  cut pipeline.
+  AI side-panel toggle).
+
+Workspace-root authorization for the cut pipeline (task #5) needed **no**
+shared-file edit: `helm_cut_workspace` authorizes each cut worktree path via
+the existing public API `modules::workspace::WorkspaceRegistry::authorize`
+(`workspace.rs` itself stays untouched).
 
 ## Local, non-committed state
 
