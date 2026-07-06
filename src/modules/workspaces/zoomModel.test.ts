@@ -1,24 +1,28 @@
 import { describe, expect, it } from "vitest";
-import type { HelmAgentSession } from "@/modules/helm/api";
+import type { HelmProcessDef, HelmSession } from "@/modules/helm/api";
 import {
   firstZoomTarget,
   groupSessions,
+  harnessToken,
   hopZoomTarget,
   messageToPtyLine,
+  processDefLabel,
   resolveZoomTarget,
   sessionTabLabel,
   toZoomSession,
 } from "./zoomModel";
 
-// Pure derivation for the zoom view (#12): which Workspace owns a clicked
-// Session, its sibling Sessions as tabs, the active tab, and the [ ]
-// workspace hop. Deterministic over data so it is CI-checked without a DOM.
+// Pure derivation for the zoom view (#12/#13): which Workspace owns a clicked
+// Session, its sibling Sessions as tabs (Agent, Shell, Process), the active
+// tab, and the [ ] workspace hop. Deterministic over data so it is CI-checked
+// without a DOM.
 
-const session = (over: Partial<HelmAgentSession> = {}): HelmAgentSession => ({
+const session = (over: Partial<HelmSession> = {}): HelmSession => ({
   sessionId: "s1",
   runtime: "local-pty",
-  harnessId: "claude-code",
   workspaceId: "ws-1",
+  kind: "agent",
+  harnessId: "claude-code",
   ...over,
 });
 
@@ -40,6 +44,41 @@ describe("sessionTabLabel", () => {
   });
 });
 
+describe("sessionTabLabel by kind", () => {
+  it("labels a shell tab", () => {
+    expect(sessionTabLabel(session({ kind: "shell" }))).toBe("shell");
+  });
+
+  it("labels a process tab name-colon-port, or bare name without a port", () => {
+    expect(
+      sessionTabLabel(
+        session({ kind: "process", processName: "dev", port: 5173 }),
+      ),
+    ).toBe("dev:5173");
+    expect(
+      sessionTabLabel(session({ kind: "process", processName: "worker" })),
+    ).toBe("worker");
+  });
+});
+
+describe("harnessToken / processDefLabel", () => {
+  it("maps claude-code to claude and passes unknown ids through", () => {
+    expect(harnessToken("claude-code")).toBe("claude");
+    expect(harnessToken("codex")).toBe("codex");
+  });
+
+  it("labels a Process add-button from its definition (name/port)", () => {
+    const withPort: HelmProcessDef = {
+      name: "dev",
+      command: "pnpm dev",
+      port: 5173,
+    };
+    const noPort: HelmProcessDef = { name: "db", command: "docker compose up" };
+    expect(processDefLabel(withPort)).toBe("dev:5173");
+    expect(processDefLabel(noPort)).toBe("db");
+  });
+});
+
 describe("toZoomSession / groupSessions", () => {
   it("maps an agent session to a labelled tab", () => {
     expect(toZoomSession(session())).toEqual({
@@ -50,13 +89,38 @@ describe("toZoomSession / groupSessions", () => {
     });
   });
 
-  it("groups sessions by workspace preserving spawn order", () => {
+  it("maps shell and process sessions to their kinds and labels", () => {
+    expect(toZoomSession(session({ sessionId: "sh", kind: "shell" }))).toEqual({
+      sessionId: "sh",
+      runtime: "local-pty",
+      kind: "shell",
+      label: "shell",
+    });
+    expect(
+      toZoomSession(
+        session({
+          sessionId: "p",
+          kind: "process",
+          processName: "dev",
+          port: 5173,
+        }),
+      ),
+    ).toEqual({
+      sessionId: "p",
+      runtime: "local-pty",
+      kind: "process",
+      label: "dev:5173",
+    });
+  });
+
+  it("groups mixed-kind sessions by workspace preserving spawn order", () => {
     const grouped = groupSessions([
       session({ sessionId: "a", workspaceId: "ws-1" }),
-      session({ sessionId: "b", workspaceId: "ws-2" }),
-      session({ sessionId: "c", workspaceId: "ws-1" }),
+      session({ sessionId: "b", workspaceId: "ws-2", kind: "shell" }),
+      session({ sessionId: "c", workspaceId: "ws-1", kind: "process" }),
     ]);
     expect(grouped["ws-1"].map((s) => s.sessionId)).toEqual(["a", "c"]);
+    expect(grouped["ws-1"].map((s) => s.kind)).toEqual(["agent", "process"]);
     expect(grouped["ws-2"].map((s) => s.sessionId)).toEqual(["b"]);
   });
 });

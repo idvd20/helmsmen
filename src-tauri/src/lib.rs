@@ -263,6 +263,8 @@ pub fn run() {
             registry::commands::helm_list_profiles,
             registry::commands::helm_update_profile,
             runtime::commands::helm_spawn_agent,
+            runtime::commands::helm_spawn_shell,
+            runtime::commands::helm_spawn_process,
             runtime::commands::helm_attach_agent,
             runtime::commands::helm_write_agent,
             runtime::commands::helm_resize_agent,

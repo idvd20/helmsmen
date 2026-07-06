@@ -84,7 +84,7 @@ function createDevConsole() {
         onExit: (code) => view.exit(code),
         ...opts,
       });
-      sessionStore.register(session);
+      sessionStore.register({ ...session, kind: "agent" });
       return session;
     } catch (error) {
       view.close();

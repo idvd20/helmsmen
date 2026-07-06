@@ -6,15 +6,21 @@
 //! injected config paths must stay inside the worktree. Everything
 //! spawned in a Workspace carries the cut's `HELMSMEN_*` env.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
-use crate::modules::core::project::validate_abs_path;
+use crate::modules::core::project::{validate_abs_path, Project};
+use crate::modules::core::settings::ProcessDef;
 use crate::modules::core::workspace::helmsmen_env;
-use crate::modules::harness::{ConfigFile, Harness, LaunchContext};
+use crate::modules::harness::{ConfigFile, Harness, LaunchContext, LaunchPlan};
 use crate::modules::registry::RegistryState;
 use crate::modules::workspace::WorkspaceRegistry;
 
 use super::SpawnSpec;
+
+/// `TERM` a GUI-launched app lacks; interactive Sessions (agent, shell,
+/// process) all need one. `HELMSMEN_*` stays exactly the specced set.
+const DEFAULT_TERM: &str = "xterm-256color";
 
 /// Per-launch values from the Profile (task #8): model and opening
 /// prompt. `Default` = launch bare (M1 behavior, and every Session after
@@ -60,6 +66,59 @@ pub fn prepare_spawn_with(
     cols: u16,
     rows: u16,
 ) -> Result<SpawnSpec, String> {
+    let base = resolve_workspace_root(registry, roots, workspace_id, cols, rows)?;
+    let ctx = LaunchContext {
+        workspace_root: &base.worktree,
+        env: &base.env,
+        model: overrides.model,
+        opening_prompt: overrides.opening_prompt,
+    };
+    apply_config_injection(&base.worktree, &harness.config_injection(&ctx))?;
+    let plan = harness.launch_plan(&ctx);
+    Ok(base.into_spec(plan, cols, rows))
+}
+
+/// The worktree + `HELMSMEN_*` env every Session in a Workspace shares,
+/// resolved once at the Harness/Shell/Process ↔ Runtime seam. Carries the
+/// resolved Project and Workspace so a Process spawn can look up its
+/// definition and a Shell spawn can read the Slot.
+struct WorkspaceRoot {
+    project: Project,
+    worktree: String,
+    env: BTreeMap<String, String>,
+}
+
+impl WorkspaceRoot {
+    /// Finish a spec from a launch plan: the plan's argv, the resolved
+    /// worktree as cwd, the `HELMSMEN_*` env plus a `TERM` default.
+    fn into_spec(mut self, plan: LaunchPlan, cols: u16, rows: u16) -> SpawnSpec {
+        self.env
+            .entry("TERM".to_string())
+            .or_insert_with(|| DEFAULT_TERM.to_string());
+        SpawnSpec {
+            program: plan.program,
+            args: plan.args,
+            cwd: self.worktree,
+            env: self.env,
+            cols,
+            rows,
+        }
+    }
+}
+
+/// Boundary validation shared by every spawn into a Workspace: the
+/// Workspace must exist in the Helmsmen registry, its worktree must still
+/// canonicalize on disk, the size must be non-zero, and the worktree is
+/// re-authorized as a Terax workspace root (idempotent, scoped to exactly
+/// that path). The stored path is data, not truth — it is re-validated and
+/// re-resolved against the real filesystem before anything spawns in it.
+fn resolve_workspace_root(
+    registry: &RegistryState,
+    roots: &WorkspaceRegistry,
+    workspace_id: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<WorkspaceRoot, String> {
     if cols == 0 || rows == 0 {
         return Err("spawn: cols and rows must be non-zero".to_string());
     }
@@ -69,50 +128,138 @@ pub fn prepare_spawn_with(
         .workspaces
         .iter()
         .find(|w| w.id == workspace_id)
-        .ok_or_else(|| format!("no workspace with id {workspace_id:?}"))?;
+        .ok_or_else(|| format!("no workspace with id {workspace_id:?}"))?
+        .clone();
     let project = state
         .projects
         .iter()
         .find(|p| p.id == workspace.project_id)
-        .ok_or_else(|| format!("no project with id {:?}", workspace.project_id))?;
+        .ok_or_else(|| format!("no project with id {:?}", workspace.project_id))?
+        .clone();
 
-    // The stored path is data, not truth: re-validate and re-resolve it
-    // against the real filesystem before anything spawns in it.
     validate_abs_path("worktreePath", &workspace.worktree_path).map_err(|e| e.to_string())?;
     let worktree = std::fs::canonicalize(&workspace.worktree_path)
         .map(|p| crate::modules::fs::to_canon(&p))
         .map_err(|e| format!("worktree {:?} is gone: {e}", workspace.worktree_path))?;
 
-    // Re-authorize the worktree as a Terax workspace root: the registry
-    // entry is durable, the in-memory authorization is not (app restart).
-    // Idempotent, and scoped to exactly this path like the cut itself.
     roots
         .authorize(&worktree)
         .map_err(|e| format!("cannot authorize workspace root {worktree:?}: {e}"))?;
 
-    let mut env = helmsmen_env(project, workspace);
-    let ctx = LaunchContext {
-        workspace_root: &worktree,
-        env: &env,
-        model: overrides.model,
-        opening_prompt: overrides.opening_prompt,
-    };
-    apply_config_injection(&worktree, &harness.config_injection(&ctx))?;
-    let plan = harness.launch_plan(&ctx);
-
-    // A GUI-launched app has no useful TERM; interactive agents need one.
-    // HELMSMEN_* stays exactly the specced set, TERM is a spawn default.
-    env.entry("TERM".to_string())
-        .or_insert_with(|| "xterm-256color".to_string());
-
-    Ok(SpawnSpec {
-        program: plan.program,
-        args: plan.args,
-        cwd: worktree,
+    let env = helmsmen_env(&project, &workspace);
+    Ok(WorkspaceRoot {
+        project,
+        worktree,
         env,
+    })
+}
+
+/// The user's interactive shell for a Shell Session: `$SHELL` when set,
+/// else `/bin/sh`. Read from the environment (the imperative shell owns the
+/// OS); the pure launch-plan builders take the resolved program as data.
+fn user_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+/// Launch plan for a Shell Session: just the user's shell, PTY-attached so
+/// it runs interactively. Argv only — nothing is re-parsed by a shell.
+pub fn shell_launch_plan(shell: &str) -> LaunchPlan {
+    LaunchPlan {
+        program: shell.to_string(),
+        args: Vec::new(),
+    }
+}
+
+/// Launch plan for a Process Session: the Project's declared command line
+/// handed to the user's shell as a single `-c` argument, exactly like the
+/// setup script. The command is the user's own settings data (never a
+/// repo-supplied value), run in the worktree; it is one argv element, so
+/// nothing Helmsmen adds is re-interpreted by the shell.
+pub fn process_launch_plan(shell: &str, command: &str) -> LaunchPlan {
+    LaunchPlan {
+        program: shell.to_string(),
+        args: vec!["-c".to_string(), command.to_string()],
+    }
+}
+
+/// Assemble a SpawnSpec for a **Shell Session** — the user's own terminal
+/// in the Workspace's worktree, carrying the cut's `HELMSMEN_*` env.
+pub fn prepare_shell_spawn(
+    registry: &RegistryState,
+    roots: &WorkspaceRegistry,
+    workspace_id: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<SpawnSpec, String> {
+    prepare_shell_spawn_with(registry, roots, workspace_id, &user_shell(), cols, rows)
+}
+
+/// Shell spawn with the shell program handed in — the test seam (a fake
+/// shell script stands in for `$SHELL` so `HELMSMEN_*` reaching a real
+/// process is provable in CI without depending on the runner's shell).
+pub fn prepare_shell_spawn_with(
+    registry: &RegistryState,
+    roots: &WorkspaceRegistry,
+    workspace_id: &str,
+    shell: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<SpawnSpec, String> {
+    let base = resolve_workspace_root(registry, roots, workspace_id, cols, rows)?;
+    Ok(base.into_spec(shell_launch_plan(shell), cols, rows))
+}
+
+/// Assemble a SpawnSpec for a **Process Session** — one of the Project's
+/// Process definitions run on demand in the Workspace's worktree. Returns
+/// the matched [`ProcessDef`] alongside the spec so the command can echo
+/// the Session's name and port back for its chip (`dev:5173`).
+pub fn prepare_process_spawn(
+    registry: &RegistryState,
+    roots: &WorkspaceRegistry,
+    workspace_id: &str,
+    process_name: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<(SpawnSpec, ProcessDef), String> {
+    prepare_process_spawn_with(
+        registry,
+        roots,
+        workspace_id,
+        process_name,
+        &user_shell(),
         cols,
         rows,
-    })
+    )
+}
+
+/// Process spawn with the shell program handed in — the test seam.
+pub fn prepare_process_spawn_with(
+    registry: &RegistryState,
+    roots: &WorkspaceRegistry,
+    workspace_id: &str,
+    process_name: &str,
+    shell: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<(SpawnSpec, ProcessDef), String> {
+    let base = resolve_workspace_root(registry, roots, workspace_id, cols, rows)?;
+    // The Process must be one the Project actually defines: the name is a
+    // key into user-level settings, never a caller-supplied command.
+    let def = base
+        .project
+        .settings
+        .processes
+        .iter()
+        .find(|p| p.name == process_name)
+        .cloned()
+        .ok_or_else(|| {
+            format!("no process {process_name:?} defined for project {:?}", base.project.name)
+        })?;
+    let plan = process_launch_plan(shell, &def.command);
+    Ok((base.into_spec(plan, cols, rows), def))
 }
 
 /// Write the Harness's config files into the worktree (M3: hook wiring;
@@ -152,6 +299,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::modules::core::project::Project;
+    use crate::modules::core::settings::ProjectSettings;
     use crate::modules::core::state::Event;
     use crate::modules::harness::{Caps, LaunchPlan};
     use crate::modules::registry::worktree;
@@ -479,5 +627,224 @@ mod tests {
             std::fs::read_to_string(tmp.path().join(".claude/hooks/wiring.json")).unwrap(),
             "{}"
         );
+    }
+
+    // --- Shell + Process Sessions (task #13) ---
+
+    /// Give a Project a single Process definition (a long-lived command that
+    /// announces its env then idles like a dev server).
+    fn define_process(f: &Fixture, name: &str, command: &str, port: Option<u16>) {
+        f.registry
+            .commit(Event::ProjectSettingsUpdated {
+                project_id: "prj-1".to_string(),
+                settings: ProjectSettings {
+                    processes: vec![ProcessDef {
+                        name: name.to_string(),
+                        command: command.to_string(),
+                        port,
+                    }],
+                    ..ProjectSettings::default()
+                },
+            })
+            .unwrap();
+    }
+
+    // --- launch-plan builders (pure) ---
+
+    #[test]
+    fn shell_plan_is_the_bare_shell_and_process_plan_is_a_single_c_argument() {
+        assert_eq!(
+            shell_launch_plan("/bin/zsh"),
+            LaunchPlan {
+                program: "/bin/zsh".to_string(),
+                args: vec![],
+            }
+        );
+        // The command is one argv element, never split by us — a hostile
+        // command string cannot inject extra argv.
+        assert_eq!(
+            process_launch_plan("/bin/sh", "pnpm dev && echo $(whoami)"),
+            LaunchPlan {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "pnpm dev && echo $(whoami)".to_string()],
+            }
+        );
+    }
+
+    // --- Shell Session payload + a real shell in the worktree ---
+
+    #[test]
+    fn shell_spawn_carries_helmsmen_env_and_the_worktree_as_cwd() {
+        let f = fixture();
+        let cut = worktree::cut(&f.registry, &f.roots, "prj-1", "sh").unwrap();
+        let spec =
+            prepare_shell_spawn_with(&f.registry, &f.roots, &cut.workspace.id, "/bin/sh", 100, 30)
+                .unwrap();
+        assert_eq!(spec.program, "/bin/sh");
+        assert!(spec.args.is_empty(), "a shell launches bare, PTY-interactive");
+        assert_eq!(spec.cwd, cut.workspace.worktree_path);
+        assert_eq!(spec.env["HELMSMEN_SLOT"], "1");
+        assert_eq!(spec.env["HELMSMEN_WORKSPACE"], cut.workspace.worktree_path);
+        assert_eq!(spec.env["HELMSMEN_PROJECT"], "demo");
+        assert_eq!(spec.env["HELMSMEN_MAIN_CHECKOUT"], f.repo_root);
+        assert!(spec.env.contains_key("TERM"));
+    }
+
+    #[test]
+    fn a_real_shell_runs_in_the_worktree_with_the_helmsmen_env() {
+        let f = fixture();
+        let cut = worktree::cut(&f.registry, &f.roots, "prj-1", "live-sh").unwrap();
+        let spec =
+            prepare_shell_spawn_with(&f.registry, &f.roots, &cut.workspace.id, "/bin/sh", 80, 24)
+                .unwrap();
+
+        let rt = LocalPty::default();
+        let (sink, out, exit) = sink();
+        let id = rt.spawn(spec, sink).unwrap();
+        // Drive the interactive shell exactly as the user would from the
+        // zoom message box: type a command; its stdout proves the shell is
+        // real, in the worktree, and carrying HELMSMEN_*.
+        rt.write(
+            &id,
+            b"printf 'SHELL_UP slot=%s cwd=%s\\n' \"$HELMSMEN_SLOT\" \"$(pwd)\"\n",
+        )
+        .unwrap();
+        // Wait on the resolved worktree path: it appears only in the shell's
+        // *executed* output, never in the PTY echo of the typed command
+        // (which still holds the literal `$(pwd)`), so this can't match the
+        // echo before the command actually runs.
+        let up = wait_for(&out, &format!("cwd={}", cut.workspace.worktree_path));
+        assert!(
+            up.contains("slot=1"),
+            "HELMSMEN_* must reach the shell (expanded, not echoed): {up}"
+        );
+        rt.kill(&id).unwrap();
+        exit.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+
+    // --- Process Session payload + a real process in the worktree ---
+
+    #[test]
+    fn process_spawn_runs_the_definition_via_the_shell_and_returns_its_chip() {
+        let f = fixture();
+        let cut = worktree::cut(&f.registry, &f.roots, "prj-1", "proc").unwrap();
+        define_process(&f, "dev", "pnpm dev", Some(5173));
+
+        let (spec, def) = prepare_process_spawn_with(
+            &f.registry,
+            &f.roots,
+            &cut.workspace.id,
+            "dev",
+            "/bin/sh",
+            120,
+            32,
+        )
+        .unwrap();
+        assert_eq!(spec.program, "/bin/sh");
+        assert_eq!(spec.args, vec!["-c".to_string(), "pnpm dev".to_string()]);
+        assert_eq!(spec.cwd, cut.workspace.worktree_path);
+        assert_eq!(spec.env["HELMSMEN_SLOT"], "1");
+        assert!(spec.env.contains_key("TERM"));
+        // The chip data the command echoes back: name + declared port.
+        assert_eq!(def.name, "dev");
+        assert_eq!(def.port, Some(5173));
+    }
+
+    #[test]
+    fn a_real_process_runs_in_the_worktree_with_the_helmsmen_env() {
+        let f = fixture();
+        let cut = worktree::cut(&f.registry, &f.roots, "prj-1", "live-proc").unwrap();
+        // A dev-server stand-in: announce the env, then stay alive.
+        define_process(
+            &f,
+            "dev",
+            "printf 'PROC_UP slot=%s cwd=%s\\n' \"$HELMSMEN_SLOT\" \"$(pwd)\"; sleep 30",
+            Some(5173),
+        );
+
+        let (spec, _def) = prepare_process_spawn_with(
+            &f.registry,
+            &f.roots,
+            &cut.workspace.id,
+            "dev",
+            "/bin/sh",
+            80,
+            24,
+        )
+        .unwrap();
+
+        let rt = LocalPty::default();
+        let (sink, out, exit) = sink();
+        let id = rt.spawn(spec, sink).unwrap();
+        let up = wait_for(&out, "PROC_UP");
+        assert!(up.contains("slot=1"), "HELMSMEN_* must reach the process: {up}");
+        assert!(
+            up.contains(&format!("cwd={}", cut.workspace.worktree_path)),
+            "the process must run in the worktree: {up}"
+        );
+        // Killing the Process Session ends only this process; the Runtime
+        // reports it exited (the frontend then drops it from the rollup).
+        rt.kill(&id).unwrap();
+        exit.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(rt.status(&id).unwrap(), SessionStatus::Exited(_)));
+    }
+
+    // --- boundary validation (the same seam as agent spawn) ---
+
+    #[test]
+    fn shell_and_process_spawn_reject_an_unknown_workspace() {
+        let f = fixture();
+        let err = prepare_shell_spawn_with(&f.registry, &f.roots, "ws-ghost", "/bin/sh", 80, 24)
+            .unwrap_err();
+        assert!(err.contains("ws-ghost"), "got: {err}");
+        let err = prepare_process_spawn_with(
+            &f.registry, &f.roots, "ws-ghost", "dev", "/bin/sh", 80, 24,
+        )
+        .unwrap_err();
+        assert!(err.contains("ws-ghost"), "got: {err}");
+    }
+
+    #[test]
+    fn process_spawn_rejects_a_name_the_project_never_defined() {
+        let f = fixture();
+        let cut = worktree::cut(&f.registry, &f.roots, "prj-1", "x").unwrap();
+        define_process(&f, "dev", "pnpm dev", None);
+        let err = prepare_process_spawn_with(
+            &f.registry,
+            &f.roots,
+            &cut.workspace.id,
+            "ghost-proc",
+            "/bin/sh",
+            80,
+            24,
+        )
+        .unwrap_err();
+        assert!(err.contains("ghost-proc"), "got: {err}");
+    }
+
+    #[test]
+    fn shell_and_process_spawn_reject_zero_size() {
+        let f = fixture();
+        let cut = worktree::cut(&f.registry, &f.roots, "prj-1", "z").unwrap();
+        define_process(&f, "dev", "pnpm dev", None);
+        assert!(
+            prepare_shell_spawn_with(&f.registry, &f.roots, &cut.workspace.id, "/bin/sh", 0, 24)
+                .is_err()
+        );
+        assert!(prepare_process_spawn_with(
+            &f.registry, &f.roots, &cut.workspace.id, "dev", "/bin/sh", 80, 0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shell_spawn_rejects_a_deleted_worktree() {
+        let f = fixture();
+        let cut = worktree::cut(&f.registry, &f.roots, "prj-1", "gone").unwrap();
+        std::fs::remove_dir_all(&cut.workspace.worktree_path).unwrap();
+        let err =
+            prepare_shell_spawn_with(&f.registry, &f.roots, &cut.workspace.id, "/bin/sh", 80, 24)
+                .unwrap_err();
+        assert!(err.contains("gone"), "got: {err}");
     }
 }
