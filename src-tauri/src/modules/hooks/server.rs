@@ -125,6 +125,23 @@ impl ControlPlaneEndpoint {
             .clone()
     }
 
+    /// Log a bulk banner decision (task #19) DISTINCTLY onto this Workspace's
+    /// audit trail: append one `Bulk`-sourced [`ApprovalRecord`] per still-open
+    /// ask (see [`record_bulk_decision`]). Returns how many were appended. The
+    /// keys are injected separately via the runtime `answer_prompt` seam; this
+    /// only records the decision, so the trail captures the queue the user
+    /// acted on even as the answered calls resolve through their hooks.
+    ///
+    /// [`ApprovalRecord`]: crate::modules::core::control_plane::ApprovalRecord
+    /// [`record_bulk_decision`]: crate::modules::core::control_plane::record_bulk_decision
+    pub fn record_bulk_decision(
+        &self,
+        decision: crate::modules::core::control_plane::CardDecision,
+    ) -> usize {
+        let mut guard = self.state.lock().expect("control-plane state mutex poisoned");
+        crate::modules::core::control_plane::record_bulk_decision(&mut guard, decision)
+    }
+
     /// Stop serving. Idempotent.
     pub fn shutdown(&self) {
         self.running.store(false, Ordering::SeqCst);

@@ -203,11 +203,27 @@ pub struct ApprovalCard {
     pub input: ToolInput,
 }
 
-/// One approval record: every policy decision writes one, so the whole
-/// decision history is auditable. Workspace scope is implicit — a
-/// [`ControlPlaneState`] belongs to exactly one Workspace's endpoint. Bulk
-/// decisions (task #19) will be logged distinctly on top of this per-call
-/// trail.
+/// Who authored an approval record. The reducer stamps every per-call policy
+/// decision [`Policy`](Self::Policy); a bulk banner action (task #19) stamps
+/// its records [`Bulk`](Self::Bulk). This marker is exactly what keeps bulk
+/// decisions "logged distinctly" from the per-call trail — same record shape,
+/// different, always-serialized source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum DecisionSource {
+    /// The reducer decided a `PreToolUse` against the user-level policy.
+    #[default]
+    Policy,
+    /// A bulk banner action (Allow all / Deny all) decided the whole pending
+    /// queue at once.
+    Bulk,
+}
+
+/// One approval record: every decision writes one, so the whole decision
+/// history is auditable. Workspace scope is implicit — a [`ControlPlaneState`]
+/// belongs to exactly one Workspace's endpoint. Per-call policy decisions and
+/// bulk-banner decisions (task #19) share this shape but carry a distinct
+/// [`source`](Self::source).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRecord {
@@ -218,6 +234,9 @@ pub struct ApprovalRecord {
     pub decision: CardDecision,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<CardRule>,
+    /// Per-call `Policy` or a `Bulk` banner action — the distinct-logging
+    /// marker.
+    pub source: DecisionSource,
 }
 
 /// The whole control-plane reduction: derived approval cards plus a warnings
@@ -326,6 +345,7 @@ pub fn apply_hook_event(
                 input: input.clone(),
                 decision,
                 rule: rule.clone(),
+                source: DecisionSource::Policy,
             });
             state.cards.push(ApprovalCard {
                 id: format!("card-{}", event.seq),
@@ -409,6 +429,61 @@ pub fn apply_hook_event(
     }
 
     state
+}
+
+/// The still-open `Ask` cards — the pending-approvals queue a bulk banner
+/// action decides and a permission prompt surfaces. Only policy `Ask` cards
+/// count (`Allow`/`Deny` are the audit trail, never asks); a resolved card
+/// (`Allowed`/`ClosedNoRun`) has left the queue. Kept in incoming (seq) order.
+/// Pure; this is the backend mirror of the frontend `deriveApprovalAsks` /
+/// `derivePausedCalls` pending predicate, so a Workspace's on-card asks and its
+/// slice of the bulk banner can never disagree on what is pending.
+pub fn pending_ask_cards(state: &ControlPlaneState) -> Vec<&ApprovalCard> {
+    state
+        .cards
+        .iter()
+        .filter(|c| c.decision == CardDecision::Ask && c.status.is_open())
+        .collect()
+}
+
+/// Build the DISTINCT bulk-decision log for a bulk banner action: one
+/// [`ApprovalRecord`] per still-open ask, stamped [`DecisionSource::Bulk`] and
+/// carrying the user's bulk [`decision`](CardDecision) (`Allow` for Allow-all,
+/// `Deny` for Deny-all) over each card's tool + exact input + rule. Pure and
+/// total — the imperative shell appends these on top of the per-call policy
+/// trail, so "who decided this, and in bulk?" is always answerable from the
+/// audit records alone. The keys themselves are injected via the runtime
+/// `answer_prompt` seam; this only produces the distinct log entries.
+pub fn bulk_decision_records(
+    state: &ControlPlaneState,
+    decision: CardDecision,
+) -> Vec<ApprovalRecord> {
+    pending_ask_cards(state)
+        .into_iter()
+        .map(|card| ApprovalRecord {
+            seq: card.seq,
+            session_id: card.session_id.clone(),
+            tool_name: card.tool_name.clone(),
+            input: card.input.clone(),
+            decision,
+            rule: card.rule.clone(),
+            source: DecisionSource::Bulk,
+        })
+        .collect()
+}
+
+/// Apply a bulk banner decision to the state in place: append the distinct
+/// bulk-decision records (see [`bulk_decision_records`]) for every still-open
+/// ask, and return how many were logged. Pure over `state` (the only mutation
+/// is the append); the card lifecycle itself still advances only through hook
+/// events (`PostToolUse` → `Allowed`, `Stop` → `ClosedNoRun`) as the answered
+/// calls resolve, so the queue drains through the same correlated path a
+/// per-card answer would.
+pub fn record_bulk_decision(state: &mut ControlPlaneState, decision: CardDecision) -> usize {
+    let records = bulk_decision_records(state, decision);
+    let n = records.len();
+    state.records.extend(records);
+    n
 }
 
 /// Map a control-plane event to the [`SessionSignal`] it implies for the
@@ -928,5 +1003,202 @@ mod tests {
             serde_json::to_value(CardStatus::ClosedNoRun).unwrap(),
             serde_json::json!("closedNoRun")
         );
+    }
+
+    // --- M3.5 bulk banner: the pending queue + distinct bulk logging ---
+
+    #[test]
+    fn pending_ask_cards_are_only_the_open_asks() {
+        // An open ask, an allowed call (audit, not an ask), an ask that already
+        // resolved, and a hard-deny (never an ask). Only the open ask queues.
+        let s = replay(&[
+            pre_cmd(1, "toolu_open", "Bash", "git push --force origin main"),
+            pre_cmd(2, "toolu_allow", "Bash", "ls"), // allow decision — audit only
+            pre_cmd(3, "toolu_done", "Bash", "git rebase -i HEAD~2"),
+            post(4, "toolu_done", "Bash"), // the ask ran → left the queue
+            pre_cmd(5, "toolu_deny", "Bash", "sudo rm -rf /var"), // hard-deny
+        ]);
+        let queue = pending_ask_cards(&s);
+        assert_eq!(queue.len(), 1, "only the one still-open ask is pending");
+        assert_eq!(queue[0].tool_use_id.as_deref(), Some("toolu_open"));
+    }
+
+    #[test]
+    fn bulk_decision_records_are_stamped_bulk_and_distinct_from_policy() {
+        // Two open asks in one session; Allow-all logs one BULK record per ask,
+        // carrying the user's decision + each card's tool/input/rule, while the
+        // original per-call records stay POLICY. That marker is the whole
+        // "logged distinctly" contract.
+        let s = replay(&[
+            pre_cmd(1, "toolu_a", "Bash", "git push --force origin main"),
+            pre_cmd(2, "toolu_b", "Bash", "git rebase -i HEAD~3"),
+        ]);
+        // Per-call trail: two policy Ask records.
+        assert_eq!(s.records.len(), 2);
+        assert!(s.records.iter().all(|r| r.source == DecisionSource::Policy));
+
+        let allow = bulk_decision_records(&s, CardDecision::Allow);
+        assert_eq!(allow.len(), 2, "one bulk record per pending ask");
+        assert!(allow.iter().all(|r| r.source == DecisionSource::Bulk));
+        assert!(allow.iter().all(|r| r.decision == CardDecision::Allow));
+        // The bulk record carries the exact command + rule of the card it
+        // decided (so the audit trail names what was bulk-allowed).
+        assert_eq!(allow[0].input.command.as_deref(), Some("git push --force origin main"));
+        assert_eq!(
+            allow[0].rule.as_ref().map(|r| r.id.as_str()),
+            Some("git-history-rewrite")
+        );
+
+        // Deny-all logs the same cards with a Deny decision, still bulk-sourced.
+        let deny = bulk_decision_records(&s, CardDecision::Deny);
+        assert!(deny.iter().all(|r| r.source == DecisionSource::Bulk
+            && r.decision == CardDecision::Deny));
+    }
+
+    #[test]
+    fn record_bulk_decision_appends_distinctly_and_leaves_policy_records() {
+        let mut s = replay(&[
+            pre_cmd(1, "toolu_a", "Bash", "git push --force origin main"),
+            pre_cmd(2, "toolu_b", "Bash", "git rebase -i HEAD~3"),
+        ]);
+        let before = s.records.len();
+        let n = record_bulk_decision(&mut s, CardDecision::Allow);
+        assert_eq!(n, 2);
+        assert_eq!(s.records.len(), before + 2);
+        // The trail now holds both kinds, distinguishable by source.
+        let policy = s.records.iter().filter(|r| r.source == DecisionSource::Policy).count();
+        let bulk = s.records.iter().filter(|r| r.source == DecisionSource::Bulk).count();
+        assert_eq!((policy, bulk), (2, 2));
+    }
+
+    #[test]
+    fn bulk_records_serialize_their_source_for_the_frontend_mirror() {
+        let mut s = replay(&[pre_cmd(1, "toolu_a", "Bash", "git push --force")]);
+        record_bulk_decision(&mut s, CardDecision::Deny);
+        let json = serde_json::to_value(&s).unwrap();
+        // The per-call record is `policy`; the appended bulk one is `bulk`.
+        assert_eq!(json["records"][0]["source"], "policy");
+        assert_eq!(json["records"][1]["source"], "bulk");
+        assert_eq!(json["records"][1]["decision"], "deny");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // M3.5 scripted demo — the milestone "Done when", backend seam.
+    //
+    //   Two agents Blocked in DIFFERENT Projects, both visible in ONE queue;
+    //   one ALLOWED and resumed exactly where it paused, one DENIED and
+    //   rerouted.
+    //
+    // This is the deterministic backend half of the M3.5 demo. The frontend
+    // half — the unified banner queue (`deriveBulkApprovals`), the banner
+    // >1-pending rule, the bulk answer plan, and the per-card answer seam
+    // calls — lives in `src/modules/helm/m3_5Demo.test.ts`. The one fragile
+    // live link, `answer_prompt` against a real `claude` PTY, is the
+    // `#[ignore]`d `live_claude_answer_prompt_seam` in `runtime::answer` (never
+    // spawned inside `cargo test`); everything here is synthetic hook events
+    // through the pure reducer + the pure bulk-log derivations.
+    //
+    // COVERED here (automated): two Projects' endpoints each reduce a risk
+    // `ask` into their own queue; the union is ONE queue of two; one call is
+    // allowed and resolves to `Allowed` correlated strictly by `tool_use_id`
+    // (resumed exactly where it paused, not by command string); the other is
+    // denied and its tool never runs (`ClosedNoRun`); and each decision is
+    // logged distinctly (per-call `Policy` + bulk `Bulk`).
+    // NOT covered (human/verify at the running Tauri app): the literal `A`/`X`
+    // key presses, the two-press confirm animation, and the banner render.
+    #[test]
+    fn m3_5_demo_two_projects_one_queue_allow_one_deny_one() {
+        let ctx = ctx();
+        // Session ids stand in for two agents in two DIFFERENT Projects; each
+        // Project runs its own control-plane endpoint (its own state).
+        let sess_a = "agent-alpha";
+        let sess_b = "agent-beta";
+        let fold = |events: &[HookEvent]| -> ControlPlaneState {
+            events
+                .iter()
+                .cloned()
+                .fold(empty_state(), |st, ev| apply_hook_event(st, ev, &ctx))
+        };
+        let ev = |seq: u64, sid: &str, kind: HookEventKind| HookEvent::new(seq, sid, kind);
+        let ask = |seq: u64, sid: &str, tuid: &str, cmd: &str| {
+            ev(
+                seq,
+                sid,
+                HookEventKind::PreToolUse {
+                    tool_use_id: Some(tuid.to_string()),
+                    tool_name: "Bash".to_string(),
+                    input: ToolInput::command(cmd),
+                },
+            )
+        };
+        let permission =
+            |seq: u64, sid: &str| ev(seq, sid, HookEventKind::Notification {
+                notification: NotificationKind::Permission,
+            });
+
+        // Both agents pause on a risk-list call and raise a permission prompt:
+        // agent A wants a force-push, agent B an interactive rebase.
+        let state_a = fold(&[
+            ask(1, sess_a, "toolu_a", "git push --force origin main"),
+            permission(2, sess_a),
+        ]);
+        let state_b = fold(&[
+            ask(1, sess_b, "toolu_b", "git rebase -i HEAD~3"),
+            permission(2, sess_b),
+        ]);
+
+        // ONE queue across the two Projects: the banner unions each endpoint's
+        // pending asks. Two agents, two Projects, one list.
+        let queue: Vec<&ApprovalCard> = pending_ask_cards(&state_a)
+            .into_iter()
+            .chain(pending_ask_cards(&state_b))
+            .collect();
+        assert_eq!(queue.len(), 2, "two agents in two Projects, one queue");
+        assert_eq!(queue[0].session_id, sess_a);
+        assert_eq!(queue[1].session_id, sess_b);
+        // Both are surfaced (blocked on a permission prompt).
+        assert!(queue.iter().all(|c| c.status == CardStatus::Surfaced));
+
+        // --- one ALLOWED and resumed exactly where it paused ---
+        // The Allow keys inject via the runtime seam (live-tested, #[ignore]d);
+        // the tool then runs and its PostToolUse resolves the card by
+        // tool_use_id — never by the (possibly RTK-rewritten) command string.
+        let state_a = apply_hook_event(
+            state_a,
+            ev(
+                3,
+                sess_a,
+                HookEventKind::PostToolUse {
+                    tool_use_id: Some("toolu_a".to_string()),
+                    tool_name: "Bash".to_string(),
+                },
+            ),
+            &ctx,
+        );
+        assert_eq!(
+            card(&state_a, "toolu_a").status,
+            CardStatus::Allowed,
+            "agent A's paused call resumed and ran, correlated by tool_use_id"
+        );
+
+        // --- one DENIED and rerouted ---
+        // Deny + reroute lands the instruction as a user message and the tool
+        // verifiably never runs; the turn ends with the ask still open, so Stop
+        // closes it ClosedNoRun (denied, never ran).
+        let state_b = apply_hook_event(state_b, ev(3, sess_b, HookEventKind::Stop), &ctx);
+        assert_eq!(
+            card(&state_b, "toolu_b").status,
+            CardStatus::ClosedNoRun,
+            "agent B's call was denied and never ran"
+        );
+
+        // The queue is now drained: neither agent is still pending.
+        assert!(pending_ask_cards(&state_a).is_empty());
+        assert!(pending_ask_cards(&state_b).is_empty());
+
+        // Both endpoints kept a clean per-call policy trail throughout.
+        assert!(state_a.records.iter().all(|r| r.source == DecisionSource::Policy));
+        assert!(state_b.records.iter().all(|r| r.source == DecisionSource::Policy));
+        assert!(state_a.warnings.is_empty() && state_b.warnings.is_empty());
     }
 }

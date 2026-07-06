@@ -14,7 +14,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import {
   mergeSessionFacts,
@@ -34,7 +34,13 @@ import {
   type HelmWorkspace,
 } from "./api";
 import { Helm } from "./Helm";
-import { buildWall, type WallView, type WorkspaceFacts } from "./viewModel";
+import {
+  buildWall,
+  deriveBulkApprovals,
+  deriveBulkAnswerPlan,
+  type WallView,
+  type WorkspaceFacts,
+} from "./viewModel";
 
 const WORKSPACE_POLL_MS = 1500;
 const CLOCK_TICK_MS = 30_000;
@@ -240,12 +246,59 @@ export function HelmView({ onZoomSession, keyboardActive = true }: HelmViewProps
     [projects, workspaces, profiles, liveFacts, nowMs],
   );
 
+  // The bulk-approvals banner (task #19): count + one-line preview derived from
+  // the same pending queue the cards read. Rendered only when >1 is pending.
+  const bulk = useMemo(() => deriveBulkApprovals(wall.cards), [wall.cards]);
+
+  // Bulk Allow-all / Deny-all: reuse #18's verify-before-inject `answer_prompt`
+  // per pending ask, iterating the whole queue. The bulk decision is logged
+  // DISTINCTLY (a bulk-flagged approval record) before the injections, so the
+  // audit trail captures the queue the user acted on even if a call resolves
+  // mid-loop. Correlation stays strictly by tool_use_id, so each paused call
+  // resumes exactly where it paused.
+  const runBulk = useCallback(
+    async (action: "allowAll" | "denyAll") => {
+      const plan = deriveBulkAnswerPlan(liveFacts);
+      if (plan.length === 0) return;
+      const workspaceIds = [...new Set(plan.map((item) => item.workspaceId))];
+      for (const workspaceId of workspaceIds) {
+        try {
+          await api.recordBulkDecision(workspaceId, action);
+        } catch {
+          // A transient log failure never blocks the decisions themselves.
+        }
+      }
+      const answer = action === "allowAll" ? "allow" : "deny";
+      for (const item of plan) {
+        if (!item.agentSession) continue; // no agent Session to receive keys
+        try {
+          await api.answerPrompt({
+            session: item.agentSession.sessionId,
+            runtime: item.agentSession.runtime,
+            toolUseId: item.toolUseId,
+            expectedCommand: item.expectedCommand,
+            action: answer,
+          });
+        } catch {
+          // A single unreachable agent skips its card; the rest proceed.
+        }
+      }
+    },
+    [api, liveFacts],
+  );
+
+  const onBulkAllow = useCallback(() => void runBulk("allowAll"), [runBulk]);
+  const onBulkDeny = useCallback(() => void runBulk("denyAll"), [runBulk]);
+
   return (
     <Helm
       wall={wall}
       projects={projects}
       keyboardActive={keyboardActive}
       onZoomSession={onZoomSession}
+      bulk={bulk}
+      onBulkAllow={onBulkAllow}
+      onBulkDeny={onBulkDeny}
     />
   );
 }

@@ -98,6 +98,18 @@ export type CardBody =
       verify: VerifyState;
     };
 
+/** A still-open policy `ask` card: a risky call paused, awaiting a decision.
+ * `allow`/`deny` cards are the audit trail, never asks; a resolved card
+ * (allowed/closed) has left the queue. The one predicate the ask block, the
+ * bulk banner, and the bulk answer plan all pause on — kept single-sourced so
+ * the on-card and banner views can never disagree on what is pending. */
+function isPendingAsk(a: HelmApproval): boolean {
+  return (
+    a.decision === "ask" &&
+    (a.status === "pending" || a.status === "surfaced")
+  );
+}
+
 /** The still-open approvals a permission answer is waiting on: only the
  * policy `ask` cards (allow/deny are the audit trail, never ask blocks) that
  * have not yet resolved (pending/surfaced). Pure and total; safe on an
@@ -106,18 +118,12 @@ export function deriveApprovalAsks(
   approvals: HelmApproval[] | undefined,
 ): ApprovalAskView[] {
   if (!approvals) return [];
-  return approvals
-    .filter(
-      (a) =>
-        a.decision === "ask" &&
-        (a.status === "pending" || a.status === "surfaced"),
-    )
-    .map((a) => ({
-      id: a.id,
-      tool: a.toolName,
-      rule: a.rule?.label ?? "risk-list rule",
-      command: a.input.command ?? a.input.filePath ?? "",
-    }));
+  return approvals.filter(isPendingAsk).map((a) => ({
+    id: a.id,
+    tool: a.toolName,
+    rule: a.rule?.label ?? "risk-list rule",
+    command: a.input.command ?? a.input.filePath ?? "",
+  }));
 }
 
 /** Host-supplied facts a Workspace card needs beyond the core entity
@@ -389,6 +395,119 @@ export function buildWall(input: WallInput): WallView {
 
   const sorted = rankSort(cards);
   return { cards: sorted, counts: deriveHeaderCounts(sorted.map((c) => c.status)) };
+}
+
+// === the bulk-approvals banner (task #19) ===
+//
+// The Approval Inbox, rendered as a banner between the toolbar and the grid
+// when MORE THAN ONE approval is pending across the whole wall. Per-approval
+// decisions stay on the cards (#18); the banner hosts BULK actions only, and
+// its count + one-line preview are PURE derivations over the same pending
+// queue the cards read (`isPendingAsk`) — so the on-card asks and the banner
+// can never disagree. Every preview string is hostile agent text; the banner
+// renders it via escaped JSX only.
+
+/** One line of the banner: a single pending ask with its Workspace context,
+ * distilled for the one-line preview. Every string is hostile agent text —
+ * render via escaped JSX only. */
+export interface BulkApprovalPreview {
+  /** The card id (stable correlation anchor; matches the on-card ask). */
+  id: string;
+  workspaceId: string;
+  projectName: string;
+  branch: string;
+  tool: string;
+  rule: string;
+  command: string;
+}
+
+/** The bulk-approvals banner model: the live pending-ask count, whether the
+ * banner shows (STRICTLY more than one pending — exactly one is the on-card
+ * ask block alone), and a one-line preview of every pending ask. */
+export interface BulkApprovalsView {
+  count: number;
+  /** Banner rule: render only when `count > 1`. */
+  visible: boolean;
+  previews: BulkApprovalPreview[];
+}
+
+/** Derive the bulk-approvals banner from the (rank-sorted) wall cards. Reads
+ * each card's already-derived approval ask block (`deriveApprovalAsks`, folded
+ * into the card body by `buildWall`), so the banner's count/preview are exactly
+ * the wall's pending asks, in wall (rank) order — Blocked cards float to the
+ * top, so the most urgent asks preview first. Pure and total. */
+export function deriveBulkApprovals(
+  cards: WorkspaceCardView[],
+): BulkApprovalsView {
+  const previews: BulkApprovalPreview[] = [];
+  for (const card of cards) {
+    if (card.body.kind !== "approval") continue;
+    for (const ask of card.body.asks) {
+      previews.push({
+        id: ask.id,
+        workspaceId: card.workspaceId,
+        projectName: card.projectName,
+        branch: card.branch,
+        tool: ask.tool,
+        rule: ask.rule,
+        command: ask.command,
+      });
+    }
+  }
+  return { count: previews.length, visible: previews.length > 1, previews };
+}
+
+/** One target of a bulk decision: the agent Session keys inject into (the
+ * Workspace's interactive agent, null if none is live to answer), the card's
+ * correlation anchor, and the exact command the answer seam verifies is on
+ * screen before injecting. */
+export interface BulkAnswerItem {
+  workspaceId: string;
+  /** The Session the keys inject into — the Workspace's Agent Session, never a
+   * shell/process. Null when no agent Session is live to receive keys. */
+  agentSession: { sessionId: string; runtime: string } | null;
+  toolUseId: string | null;
+  expectedCommand: string;
+}
+
+/** Plan a bulk Allow-all / Deny-all: one [`BulkAnswerItem`] per pending ask
+ * across every Workspace, resolved from the host facts (each Workspace's
+ * approval cards + its live Sessions). The shell iterates this applying #18's
+ * `answer_prompt` per card; correlation stays strictly by `tool_use_id`, so a
+ * bulk answer resumes each paused call exactly where it paused. Pure and
+ * total. */
+export function deriveBulkAnswerPlan(
+  facts: Record<string, WorkspaceFacts>,
+): BulkAnswerItem[] {
+  const plan: BulkAnswerItem[] = [];
+  for (const [workspaceId, f] of Object.entries(facts)) {
+    const asks = (f.approvals ?? []).filter(isPendingAsk);
+    if (asks.length === 0) continue;
+    const agent = (f.sessions ?? []).find((s) => s.kind === "agent");
+    const agentSession = agent
+      ? { sessionId: agent.sessionId, runtime: agent.runtime }
+      : null;
+    for (const a of asks) {
+      plan.push({
+        workspaceId,
+        agentSession,
+        toolUseId: a.toolUseId,
+        expectedCommand: a.input.command ?? a.input.filePath ?? "",
+      });
+    }
+  }
+  return plan;
+}
+
+/** The two-press confirm guarding Allow-all specifically (Deny-all is a single
+ * action). Given the current armed flag, the next press either ARMS the
+ * confirm (first press) or FIRES it (second press) and disarms. Pure state
+ * transition so the banner button and the `A` key share one contract. */
+export function nextAllowAllConfirm(armed: boolean): {
+  armed: boolean;
+  fire: boolean;
+} {
+  return armed ? { armed: false, fire: true } : { armed: true, fire: false };
 }
 
 // === the Helm's scoping controls (task #14) ===
@@ -667,6 +786,8 @@ export type HelmWallAction =
   | { kind: "clear-filters" }
   | { kind: "answer-allow" }
   | { kind: "answer-deny" }
+  | { kind: "bulk-allow-all" }
+  | { kind: "bulk-deny-all" }
   | { kind: "none" };
 
 /** The subset of a KeyboardEvent the map reads (plain data, so tests need
@@ -695,7 +816,11 @@ export interface HelmWallKeyContext {
  * open are left alone. While the repo picker is open it owns the keys
  * (`r`/`esc` close it; everything else is inert). `a`/`x` answer the
  * selected/blocked card's paused approval (Allow / Deny) — the container
- * resolves which card and injects nothing if none is answerable. */
+ * resolves which card and injects nothing if none is answerable. `A`/`X`
+ * (shift) are the bulk banner's Allow-all / Deny-all; `A` two-presses to
+ * confirm (the container arms it, and only acts while the banner shows).
+ * Shift is not a chord here — the letter keys are already single-letter — so
+ * only Ctrl/Meta/Alt yield to the browser. */
 export function mapHelmWallKey(
   ev: HelmWallKeyInput,
   ctx: HelmWallKeyContext,
@@ -720,6 +845,10 @@ export function mapHelmWallKey(
       return { kind: "answer-allow" };
     case "x":
       return { kind: "answer-deny" };
+    case "A":
+      return { kind: "bulk-allow-all" };
+    case "X":
+      return { kind: "bulk-deny-all" };
     case "Escape":
       return { kind: "clear-filters" };
     default:

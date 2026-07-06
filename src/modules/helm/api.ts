@@ -261,6 +261,12 @@ export interface HelmApproval {
   input: HelmToolInput;
 }
 
+/** Who wrote an approval record. `policy` = the reducer decided a tool call;
+ * `bulk` = a bulk banner action (Allow all / Deny all) decided it. Mirrors the
+ * backend `core::control_plane::DecisionSource`; the marker is what keeps bulk
+ * decisions logged distinctly from per-call ones. */
+export type HelmDecisionSource = "policy" | "bulk";
+
 /** One append-only approval record — a single policy decision, for the audit
  * trail. Mirrors the backend `core::control_plane::ApprovalRecord`. */
 export interface HelmApprovalRecord {
@@ -270,7 +276,12 @@ export interface HelmApprovalRecord {
   input: HelmToolInput;
   decision: HelmCardDecision;
   rule?: HelmCardRule;
+  /** How the decision was made — per-call `policy` or a `bulk` banner action. */
+  source: HelmDecisionSource;
 }
+
+/** A bulk banner action over the whole pending queue. */
+export type HelmBulkAction = "allowAll" | "denyAll";
 
 /** A Workspace's whole derived control-plane state, as the endpoint
  * serializes it. Mirrors the backend `core::control_plane::ControlPlaneState`.
@@ -542,6 +553,15 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
   const answerPrompt = (input: AnswerPromptInput) =>
     invoke<HelmAnswerOutcome>("helm_answer_prompt", { input });
 
+  /** Log a bulk banner decision (Allow all / Deny all) DISTINCTLY on a
+   * Workspace's audit trail — one bulk-sourced approval record per still-open
+   * ask, so a bulk decision is never confused with the per-call policy trail.
+   * Returns how many records were appended (0 if the Workspace has no live
+   * endpoint or nothing pending). The keys are still injected via
+   * `answerPrompt`; this is only the distinct log. */
+  const recordBulkDecision = (workspaceId: string, action: HelmBulkAction) =>
+    invoke<number>("helm_record_bulk_decision", { workspaceId, action });
+
   return {
     detectProject,
     addProject,
@@ -566,6 +586,7 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
     killAgent,
     approvalsSnapshot,
     answerPrompt,
+    recordBulkDecision,
   };
 }
 
