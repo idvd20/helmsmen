@@ -1,6 +1,8 @@
 pub mod modules;
 
-use modules::{agent, fs, git, harness, history, net, pty, registry, runtime, secrets, shell, workspace};
+use modules::{
+    agent, fs, git, harness, history, hooks, net, pty, registry, runtime, secrets, shell, workspace,
+};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 #[cfg(target_os = "macos")]
@@ -164,6 +166,10 @@ pub fn run() {
         // Helmsmen runtime layer: Agent Sessions on LocalPty (task #6,
         // HELMSMEN integration point — see docs/fork-posture.md).
         .manage(runtime::RuntimeState::default())
+        // Helmsmen control plane: one per-Workspace loopback endpoint per cut
+        // (task #16). Kept as app-lifetime state so every Session in a
+        // Workspace shares its hook endpoint (port + token).
+        .manage(hooks::EndpointRegistry::default())
         .manage(shell::ShellState::default())
         .manage(secrets::SecretsState::default())
         .manage(fs::watch::FsWatchState::default())

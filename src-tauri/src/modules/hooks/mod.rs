@@ -16,6 +16,10 @@
 //! - [`server`] — the `std::net` loopback listener that reads sockets, calls
 //!   [`wire::handle_request`], folds accepted events into the pure core, and
 //!   answers with terse HTTP. The only place with the network.
+//! - [`config`] — pure composer for the Claude Code hook settings the cut
+//!   writes into the worktree so `claude` POSTs its hook events here (#16).
+//! - [`registry`] — keeps one endpoint alive per Workspace, so every Session
+//!   in it shares the same loopback port and token (#16).
 //!
 //! Security invariants (PRD, verbatim): the endpoint binds loopback only; a
 //! per-session bearer token is required; payloads are typed-parsed and
@@ -25,8 +29,12 @@
 //! core — a guard test in `modules::registry` enforces that
 //! `modules::core` imports no network, async, or process code.
 
+pub mod config;
+pub mod registry;
 pub mod server;
 pub mod wire;
 
+pub use config::{claude_code_hook_settings, CLAUDE_HOOK_SETTINGS_REL};
+pub use registry::EndpointRegistry;
 pub use server::ControlPlaneEndpoint;
 pub use wire::{handle_request, parse_hook_event, Outcome, Rejection, RequestParts, MAX_BODY_BYTES};

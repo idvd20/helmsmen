@@ -216,6 +216,10 @@ pub fn helm_cut_pipeline(
         let registry = app.state::<RegistryState>();
         let roots = app.state::<WorkspaceRegistry>();
         let runtimes = app.state::<crate::modules::runtime::RuntimeState>();
+        // The per-Workspace control-plane endpoints (task #16): the pipeline
+        // starts one here for a control-plane-hooks Harness and keeps it live
+        // for the Workspace's lifetime.
+        let endpoints = app.state::<crate::modules::hooks::EndpointRegistry>();
         // Both resolutions were verified at enqueue / are compiled-in;
         // failing here means the app is misassembled — still park rather
         // than lose the cut silently.
@@ -232,19 +236,25 @@ pub fn helm_cut_pipeline(
                 format!("unknown harness {:?}", enqueued.profile.harness_id),
             );
         };
-        pipeline::run(&registry, &roots, runtime.as_ref(), harness, &enqueued);
+        pipeline::run(&registry, &roots, runtime.as_ref(), harness, &endpoints, &enqueued);
     });
     Ok(workspace)
 }
 
 /// Remove a Workspace: delete worktree and branch, free the Slot, update
-/// the registry.
+/// the registry, and drop its control-plane endpoint (task #16) so the
+/// loopback listener does not outlive the Workspace.
 #[tauri::command]
 pub fn helm_remove_workspace(
     registry: State<'_, RegistryState>,
+    endpoints: State<'_, crate::modules::hooks::EndpointRegistry>,
     workspace_id: String,
 ) -> Result<(), String> {
-    worktree::remove(&registry, &workspace_id)
+    worktree::remove(&registry, &workspace_id)?;
+    // Only after the git + registry teardown succeeds: a failed remove leaves
+    // the Workspace live, so its endpoint must stay too.
+    endpoints.remove(&workspace_id);
+    Ok(())
 }
 
 /// List all live Workspaces.
