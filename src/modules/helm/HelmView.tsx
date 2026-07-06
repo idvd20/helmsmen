@@ -38,6 +38,9 @@ import {
   buildWall,
   deriveBulkApprovals,
   deriveBulkAnswerPlan,
+  deriveCardAnswerItem,
+  describeAnswerOutcome,
+  type WallAnswerTarget,
   type WallView,
   type WorkspaceFacts,
 } from "./viewModel";
@@ -290,6 +293,44 @@ export function HelmView({ onZoomSession, keyboardActive = true }: HelmViewProps
   const onBulkAllow = useCallback(() => void runBulk("allowAll"), [runBulk]);
   const onBulkDeny = useCallback(() => void runBulk("denyAll"), [runBulk]);
 
+  // Per-card Allow/Deny from the wall (`a`/`x`, task #34): the wall resolved
+  // WHICH card; resolve that ask to its live agent Session + correlation
+  // anchor and answer through #18's verify-before-inject seam — the zoom's
+  // answer path, from the wall. Every non-answer (ask already resolved, no
+  // agent Session, a mismatch — the backend injected NOTHING because the
+  // visible dialog was not this card's, or an unreachable agent) surfaces as
+  // a note instead of a silent no-op. The approvals poll reconciles the card.
+  const [answerNote, setAnswerNote] = useState<string | null>(null);
+  const onAnswerCard = useCallback(
+    (target: WallAnswerTarget, action: "allow" | "deny") => {
+      void (async () => {
+        setAnswerNote(null);
+        const item = deriveCardAnswerItem(liveFacts, target);
+        if (!item) {
+          setAnswerNote("ask already resolved — nothing to answer");
+          return;
+        }
+        if (!item.agentSession) {
+          setAnswerNote("no agent session in this workspace to answer");
+          return;
+        }
+        try {
+          const outcome = await api.answerPrompt({
+            session: item.agentSession.sessionId,
+            runtime: item.agentSession.runtime,
+            toolUseId: item.toolUseId,
+            expectedCommand: item.expectedCommand,
+            action,
+          });
+          setAnswerNote(describeAnswerOutcome(outcome));
+        } catch {
+          setAnswerNote("could not reach the agent");
+        }
+      })();
+    },
+    [api, liveFacts],
+  );
+
   return (
     <Helm
       wall={wall}
@@ -299,6 +340,8 @@ export function HelmView({ onZoomSession, keyboardActive = true }: HelmViewProps
       bulk={bulk}
       onBulkAllow={onBulkAllow}
       onBulkDeny={onBulkDeny}
+      onAnswerCard={onAnswerCard}
+      answerNote={answerNote}
     />
   );
 }

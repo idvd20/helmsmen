@@ -6,11 +6,12 @@
 // repo picker (`r`) that scopes the wall to one Project. No sidebar (PRD).
 //
 // Still render-pure: every projection (rank sort, header counts, status
-// rollup, filter/group/scope) is a tested pure function in viewModel.ts;
-// this component only holds the active filter/group/scope UI state, maps
-// `f`/`g`/`r`/esc through the pure `mapHelmWallKey`, and renders what the
-// derivations return. Every dynamic string (repo name, branch, activity)
-// reaches the DOM as an escaped JSX text node — never an HTML sink.
+// rollup, filter/group/scope, the `a`/`x` answer target) is a tested pure
+// function in viewModel.ts; this component only holds the active
+// filter/group/scope UI state, maps `f`/`g`/`r`/`a`/`x`/esc through the pure
+// `mapHelmWallKey`, and renders what the derivations return. Every dynamic
+// string (repo name, branch, activity) reaches the DOM as an escaped JSX
+// text node — never an HTML sink.
 
 import type { CSSProperties } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -22,12 +23,14 @@ import {
   cycleGroup,
   deriveFilterTabs,
   deriveRepoPicker,
+  deriveWallAnswerTarget,
   filterCards,
   type GroupMode,
   groupCards,
   mapHelmWallKey,
   nextAllowAllConfirm,
   type RepoPickerEntry,
+  type WallAnswerTarget,
   type WallFilter,
   type WallGroup,
   type WallView,
@@ -68,6 +71,15 @@ export interface HelmProps {
   /** Bulk Deny-all — the container denies every pending ask. Single action
    * (no confirm). */
   onBulkDeny?: () => void;
+  /** Per-card Allow/Deny (`a`/`x`, task #18/#34): answer the targeted card's
+   * paused approval. The wall resolves WHICH card (the top visible approval
+   * ask, via `deriveWallAnswerTarget`); the container resolves its live agent
+   * Session and answers through the verify-before-inject seam. */
+  onAnswerCard?: (target: WallAnswerTarget, action: "allow" | "deny") => void;
+  /** Feedback from the last per-card answer (e.g. a verify-before-inject
+   * mismatch: nothing was injected). Rendered as a status line; null hides
+   * it. */
+  answerNote?: string | null;
 }
 
 function isEditable(el: Element | null): boolean {
@@ -89,6 +101,8 @@ export function Helm({
   bulk,
   onBulkAllow,
   onBulkDeny,
+  onAnswerCard,
+  answerNote,
 }: HelmProps) {
   const { counts, cards } = wall;
   const [filter, setFilter] = useState<WallFilter>("all");
@@ -146,9 +160,10 @@ export function Helm({
   }, []);
 
   // Wall keyboard: `f` cycles filters, `g` toggles grouping, `r` opens the
-  // repo picker, `esc` clears filters. All decisions live in the pure
-  // `mapHelmWallKey`; it yields while a field is focused, while an overlay
-  // owns the keyboard, and never shadows a modified chord.
+  // repo picker, `esc` clears filters, `a`/`x` answer the top visible card's
+  // paused approval, `A`/`X` are the banner's bulk pair. All decisions live
+  // in the pure `mapHelmWallKey`; it yields while a field is focused, while
+  // an overlay owns the keyboard, and never shadows a modified chord.
   useEffect(() => {
     const onKeyDown = (ev: KeyboardEvent) => {
       const action = mapHelmWallKey(
@@ -171,6 +186,19 @@ export function Helm({
         (action.kind === "bulk-allow-all" || action.kind === "bulk-deny-all") &&
         !bulkVisible
       ) {
+        return;
+      }
+      // Per-card `a`/`x` (task #34): answer the top VISIBLE card showing an
+      // approval ask block. With nothing answerable in view the press falls
+      // through untouched (never swallowed, never injected blind).
+      if (action.kind === "answer-allow" || action.kind === "answer-deny") {
+        const target = deriveWallAnswerTarget(visible);
+        if (!target) return;
+        ev.preventDefault();
+        onAnswerCard?.(
+          target,
+          action.kind === "answer-allow" ? "allow" : "deny",
+        );
         return;
       }
       ev.preventDefault();
@@ -202,7 +230,15 @@ export function Helm({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [keyboardActive, pickerOpen, bulkVisible, fireBulkAllow, fireBulkDeny]);
+  }, [
+    keyboardActive,
+    pickerOpen,
+    bulkVisible,
+    fireBulkAllow,
+    fireBulkDeny,
+    visible,
+    onAnswerCard,
+  ]);
 
   return (
     <div style={wallStyle}>
@@ -337,6 +373,14 @@ export function Helm({
           onAllow={fireBulkAllow}
           onDeny={fireBulkDeny}
         />
+      ) : null}
+
+      {/* Per-card answer feedback (task #34): a verify-before-inject mismatch
+          means nothing was injected — say so instead of a silent no-op. */}
+      {answerNote ? (
+        <p style={answerNoteStyle} role="status" aria-live="polite">
+          ⚠ {answerNote}
+        </p>
       ) : null}
 
       {cards.length === 0 ? (
@@ -645,6 +689,15 @@ const bannerStyle: CSSProperties = {
   padding: "10px 16px",
   background: "#1a1013",
   borderBottom: "1px solid #4a2327",
+};
+
+const answerNoteStyle: CSSProperties = {
+  margin: 0,
+  padding: "6px 16px",
+  background: "#1a1013",
+  borderBottom: "1px solid #4a2327",
+  color: "#f2b8bb",
+  fontSize: 12,
 };
 
 const bannerHeadStyle: CSSProperties = {
