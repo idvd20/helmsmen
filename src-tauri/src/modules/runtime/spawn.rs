@@ -272,8 +272,13 @@ pub fn prepare_process_spawn_with(
 /// Write the Harness's config files into the worktree (M3: hook wiring;
 /// also the cut pipeline's harness-wiring step, task #8). Paths are
 /// hostile until proven worktree-relative: absolute paths and any `..`
-/// component are rejected before a byte is written.
+/// component are rejected lexically, and because a checked-out branch can
+/// plant symlinks the destination is also resolved against the live
+/// filesystem and must stay inside the canonical worktree root. Fail safe:
+/// anything unresolvable or out-of-root refuses before a byte is written.
 pub(crate) fn apply_config_injection(worktree: &str, files: &[ConfigFile]) -> Result<(), String> {
+    let root = std::fs::canonicalize(worktree)
+        .map_err(|e| format!("cannot resolve worktree {worktree:?}: {e}"))?;
     for file in files {
         let rel = Path::new(&file.rel_path);
         let escapes = rel.is_absolute()
@@ -286,15 +291,61 @@ pub(crate) fn apply_config_injection(worktree: &str, files: &[ConfigFile]) -> Re
                 file.rel_path
             ));
         }
-        let dest = Path::new(worktree).join(rel);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        let dest = root.join(rel);
+        let parent = dest
+            .parent()
+            .ok_or_else(|| format!("config injection path {:?} has no parent", file.rel_path))?;
+        // Resolve before creating anything so a symlinked component cannot
+        // carry even an intermediate directory outside the root.
+        ensure_within_root(&root, deepest_existing_ancestor(parent), &file.rel_path)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        // Re-check the created parent: the containment must hold on the
+        // path actually being written through, not just the pre-image.
+        ensure_within_root(&root, parent, &file.rel_path)?;
+        // `fs::write` follows a symlinked leaf to some other file; a config
+        // destination that is a symlink is never legitimate, so refuse.
+        if std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "config injection refuses to write through symlink {}",
+                dest.display()
+            ));
         }
         std::fs::write(&dest, &file.contents)
             .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
     }
     Ok(())
+}
+
+/// Containment check for one injected destination: `candidate` must
+/// resolve (symlinks and all) to a path under the canonical `root`.
+fn ensure_within_root(root: &Path, candidate: &Path, rel_path: &str) -> Result<(), String> {
+    let resolved = std::fs::canonicalize(candidate).map_err(|e| {
+        format!(
+            "config injection path {rel_path:?}: cannot resolve {}: {e}",
+            candidate.display()
+        )
+    })?;
+    if !resolved.starts_with(root) {
+        return Err(format!(
+            "config injection path {rel_path:?} escapes the worktree (resolves to {})",
+            resolved.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The closest ancestor of `path` that exists on disk (symlinks count as
+/// existing, dangling or not, so they are resolved rather than skipped).
+fn deepest_existing_ancestor(path: &Path) -> &Path {
+    let mut cur = path;
+    while std::fs::symlink_metadata(cur).is_err() {
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    cur
 }
 
 #[cfg(all(test, unix))]
@@ -633,6 +684,112 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(tmp.path().join(".claude/hooks/wiring.json")).unwrap(),
             "{}"
+        );
+    }
+
+    #[test]
+    fn config_injection_refuses_a_symlinked_directory_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // A repo-supplied symlink checked out into the worktree: lexically
+        // the path is worktree-relative, on disk it points elsewhere.
+        std::os::unix::fs::symlink(&outside, worktree.join(".claude")).unwrap();
+        let root = crate::modules::fs::to_canon(&worktree);
+        let err = apply_config_injection(
+            &root,
+            &[ConfigFile {
+                rel_path: ".claude/hooks/wiring.json".to_string(),
+                contents: "pwned".to_string(),
+            }],
+        )
+        .expect_err("a symlinked directory component must be refused");
+        assert!(err.contains("escapes the worktree"), "got: {err}");
+        // Nothing landed outside the root, not even the intermediate dir.
+        assert!(!outside.join("hooks").exists());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn config_injection_refuses_a_dangling_symlinked_directory_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), worktree.join(".claude")).unwrap();
+        let root = crate::modules::fs::to_canon(&worktree);
+        let err = apply_config_injection(
+            &root,
+            &[ConfigFile {
+                rel_path: ".claude/settings.json".to_string(),
+                contents: "x".to_string(),
+            }],
+        )
+        .expect_err("an unresolvable component must be refused");
+        assert!(err.contains("cannot resolve"), "got: {err}");
+        assert!(!tmp.path().join("nowhere").exists());
+    }
+
+    #[test]
+    fn config_injection_refuses_a_symlinked_leaf_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(worktree.join(".claude")).unwrap();
+        let target = tmp.path().join("victim.json");
+        std::fs::write(&target, "original").unwrap();
+        std::os::unix::fs::symlink(&target, worktree.join(".claude/settings.json")).unwrap();
+        let root = crate::modules::fs::to_canon(&worktree);
+        let err = apply_config_injection(
+            &root,
+            &[ConfigFile {
+                rel_path: ".claude/settings.json".to_string(),
+                contents: "pwned".to_string(),
+            }],
+        )
+        .expect_err("writing through a symlinked leaf must be refused");
+        assert!(err.contains("symlink"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+    }
+
+    #[test]
+    fn config_injection_allows_a_symlink_that_stays_inside_the_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(worktree.join("shared")).unwrap();
+        std::os::unix::fs::symlink(worktree.join("shared"), worktree.join(".claude")).unwrap();
+        let root = crate::modules::fs::to_canon(&worktree);
+        apply_config_injection(
+            &root,
+            &[ConfigFile {
+                rel_path: ".claude/settings.json".to_string(),
+                contents: "ok".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("shared/settings.json")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn config_injection_overwrites_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::fs::write(tmp.path().join(".claude/settings.json"), "stale").unwrap();
+        let root = crate::modules::fs::to_canon(tmp.path());
+        apply_config_injection(
+            &root,
+            &[ConfigFile {
+                rel_path: ".claude/settings.json".to_string(),
+                contents: "fresh".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap(),
+            "fresh"
         );
     }
 
