@@ -16,6 +16,7 @@
 import {
   deriveWorkspaceStatus,
   HELM_STATUS_ALIAS,
+  type HelmAnswerOutcome,
   type HelmApproval,
   type HelmCutState,
   type HelmCutStep,
@@ -814,9 +815,10 @@ export interface HelmWallKeyContext {
 /** Map a wall key press to an action. Modified chords (Ctrl/Meta/Alt),
  * every key while a field is focused, and every key while an overlay is
  * open are left alone. While the repo picker is open it owns the keys
- * (`r`/`esc` close it; everything else is inert). `a`/`x` answer the
- * selected/blocked card's paused approval (Allow / Deny) — the container
- * resolves which card and injects nothing if none is answerable. `A`/`X`
+ * (`r`/`esc` close it; everything else is inert). `a`/`x` answer the top
+ * visible Blocked card's paused approval (Allow / Deny) — the wall resolves
+ * which card ([`deriveWallAnswerTarget`]) and injects nothing (the press
+ * falls through) if none is answerable. `A`/`X`
  * (shift) are the bulk banner's Allow-all / Deny-all; `A` two-presses to
  * confirm (the container arms it, and only acts while the banner shows).
  * Shift is not a chord here — the letter keys are already single-letter — so
@@ -854,4 +856,87 @@ export function mapHelmWallKey(
     default:
       return { kind: "none" };
   }
+}
+
+// === per-card Allow/Deny from the wall (`a`/`x`, task #34) ===
+//
+// The wall counterpart of the zoom's answer path: `a`/`x` answer ONE paused
+// approval through #18's verify-before-inject seam. These are the pure halves
+// Helm.tsx / HelmView.tsx compose: which card the key acts on (over the cards
+// the user can SEE — the scoped/filtered set), and that ask resolved to its
+// live agent Session + correlation anchor. Both fail safe: an unanswerable
+// wall yields null and the shell injects nothing.
+
+/** The card a wall `a`/`x` press acts on: the Workspace plus the exact ask
+ * card id (the correlation anchor the shell resolves back to a live agent
+ * Session + tool_use_id via [`deriveCardAnswerItem`]). */
+export interface WallAnswerTarget {
+  workspaceId: string;
+  askId: string;
+}
+
+/** Resolve which card the wall's `a`/`x` answers: the FIRST card in the given
+ * (visible, rank-ordered) list showing an approval ask block, taking its first
+ * pending ask — Blocked cards float to the top, so this is the wall's most
+ * urgent ask, matching the bulk banner's preview order. Null when nothing
+ * visible is answerable (no approval ask block — a cut-failed Blocked card
+ * does not count): the key press must stay a no-op and inject nothing. */
+export function deriveWallAnswerTarget(
+  cards: WorkspaceCardView[],
+): WallAnswerTarget | null {
+  for (const card of cards) {
+    if (card.body.kind === "approval" && card.body.asks.length > 0) {
+      return { workspaceId: card.workspaceId, askId: card.body.asks[0].id };
+    }
+  }
+  return null;
+}
+
+/** One per-card answer resolved from the host facts: the agent Session the
+ * keys inject into (null when none is live to receive them) and the paused
+ * call's correlation anchor + exact command the answer seam verifies is on
+ * screen before injecting. Mirrors the bulk plan's Session resolution for a
+ * single ask. */
+export interface CardAnswerItem {
+  workspaceId: string;
+  agentSession: { sessionId: string; runtime: string } | null;
+  toolUseId: string | null;
+  expectedCommand: string;
+}
+
+/** Resolve one [`WallAnswerTarget`] against the live facts. Null when the ask
+ * is no longer pending (it resolved between the key press and now) or the
+ * Workspace/ask is unknown — a stale press answers NOTHING rather than the
+ * wrong card (fail safe; verify-before-inject then guards the send itself). */
+export function deriveCardAnswerItem(
+  facts: Record<string, WorkspaceFacts>,
+  target: WallAnswerTarget,
+): CardAnswerItem | null {
+  const f = facts[target.workspaceId];
+  if (!f) return null;
+  const ask = (f.approvals ?? []).find(
+    (a) => a.id === target.askId && isPendingAsk(a),
+  );
+  if (!ask) return null;
+  const agent = (f.sessions ?? []).find((s) => s.kind === "agent");
+  return {
+    workspaceId: target.workspaceId,
+    agentSession: agent
+      ? { sessionId: agent.sessionId, runtime: agent.runtime }
+      : null,
+    toolUseId: ask.toolUseId,
+    expectedCommand: ask.input.command ?? ask.input.filePath ?? "",
+  };
+}
+
+/** The wall's feedback line for a per-card answer outcome. `injected` needs
+ * no note (the approvals poll resolves the card); a `mismatch` means the
+ * backend verified the visible dialog was NOT this card's and injected
+ * NOTHING — that must reach the user, never be discarded. */
+export function describeAnswerOutcome(
+  outcome: HelmAnswerOutcome,
+): string | null {
+  return outcome.status === "mismatch"
+    ? "dialog changed — not answered; re-check the call"
+    : null;
 }
