@@ -21,6 +21,8 @@ import {
   type HelmApi,
 } from "@/modules/helm/api";
 import { HelmView } from "@/modules/helm/HelmView";
+import { NewWorkspace } from "./NewWorkspace";
+import { mapWallKey } from "./newWorkspaceModel";
 import { sessionStore } from "./sessionStore";
 import { Zoom } from "./Zoom";
 import {
@@ -53,6 +55,9 @@ export function Quarterdeck({ api }: QuarterdeckProps) {
   const [sessions, setSessions] = useState(() => sessionStore.list());
   const [workspaces, setWorkspaces] = useState<ZoomWorkspaceRef[]>([]);
   const [zoom, setZoom] = useState<ZoomTarget | null>(null);
+  // #9: `n` on the Helm opens the New Workspace screen (an overlay route,
+  // mutually exclusive with zoom).
+  const [newWorkspaceOpen, setNewWorkspaceOpen] = useState(false);
 
   // Live spawned-Session registry (interim, see sessionStore.ts).
   useEffect(
@@ -105,7 +110,7 @@ export function Quarterdeck({ api }: QuarterdeckProps) {
   // until the wall gains a card cursor — see the module journal). Yields to
   // any focused field (e.g. the New Workspace modal).
   useEffect(() => {
-    if (zoom) return;
+    if (zoom || newWorkspaceOpen) return;
     const onKeyDown = (ev: KeyboardEvent) => {
       if (ev.key !== "Enter" || isEditable(document.activeElement)) return;
       const target = firstZoomTarget(workspaces, grouped);
@@ -116,7 +121,33 @@ export function Quarterdeck({ api }: QuarterdeckProps) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [zoom, workspaces, grouped]);
+  }, [zoom, newWorkspaceOpen, workspaces, grouped]);
+
+  // #9: WALL-level `n` opens the New Workspace screen. Additive and
+  // localized — it yields while a field is focused (the key types) and
+  // while any overlay (zoom or the screen) is already open, and never
+  // shadows a modified chord. Decision lives in the pure `mapWallKey`.
+  useEffect(() => {
+    const onKeyDown = (ev: KeyboardEvent) => {
+      const action = mapWallKey(
+        {
+          key: ev.key,
+          ctrlKey: ev.ctrlKey,
+          metaKey: ev.metaKey,
+          altKey: ev.altKey,
+        },
+        {
+          editing: isEditable(document.activeElement),
+          overlayOpen: zoom !== null || newWorkspaceOpen,
+        },
+      );
+      if (action.kind !== "new-workspace") return;
+      ev.preventDefault();
+      setNewWorkspaceOpen(true);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [zoom, newWorkspaceOpen]);
 
   return (
     <>
@@ -128,6 +159,9 @@ export function Quarterdeck({ api }: QuarterdeckProps) {
           onReturn={() => setZoom(null)}
           onHopWorkspace={hop}
         />
+      ) : null}
+      {newWorkspaceOpen ? (
+        <NewWorkspace api={api} onReturn={() => setNewWorkspaceOpen(false)} />
       ) : null}
     </>
   );
