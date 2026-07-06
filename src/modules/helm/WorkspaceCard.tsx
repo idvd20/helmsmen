@@ -80,6 +80,22 @@ function CardBodyView({ body }: { body: CardBody }) {
           {body.log ? <pre style={logStyle}>{body.log}</pre> : null}
         </div>
       );
+    case "approval":
+      // The ask block: tool, rule that fired, exact command. Every field is
+      // hostile agent text and reaches the DOM only as an escaped JSX text
+      // node (the command via <pre>{…}</pre>), never an HTML sink.
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {body.asks.map((ask) => (
+            <div key={ask.id}>
+              <p style={{ margin: 0, color: STATUS_COLOR.blocked }}>
+                ⏸ {ask.tool} · {ask.rule}
+              </p>
+              <pre style={logStyle}>{ask.command}</pre>
+            </div>
+          ))}
+        </div>
+      );
     case "activity":
       return (
         <div>

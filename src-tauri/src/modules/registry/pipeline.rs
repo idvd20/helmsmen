@@ -266,7 +266,7 @@ pub fn run(
     // (Cap degradation). Hostile config paths are still rejected inside the
     // worktree boundary; a failure to bind parks the cut at this step.
     let endpoint = if harness.caps().control_plane_hooks {
-        match endpoints.start_for(&ws.id) {
+        match endpoints.start_for(&ws.id, &ws.worktree_path) {
             Ok(endpoint) => Some(endpoint),
             Err(e) => {
                 return park(

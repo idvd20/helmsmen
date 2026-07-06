@@ -219,6 +219,48 @@ export type HelmSessionStatus =
   | { state: "running" }
   | { state: "exited"; code: number };
 
+/** Where an approval card is in its correlation lifecycle. Mirrors the
+ * backend `core::control_plane::CardStatus`. */
+export type HelmCardStatus = "pending" | "surfaced" | "allowed" | "closedNoRun";
+
+/** What the user-level policy decided for a call. Mirrors the backend
+ * `core::control_plane::CardDecision`. Only `ask` cards render as ask blocks;
+ * `allow`/`deny` are the audit trail. */
+export type HelmCardDecision = "allow" | "ask" | "deny";
+
+/** The rule that fired, as the ask block shows it. Mirrors the backend
+ * `core::control_plane::CardRule`. */
+export interface HelmCardRule {
+  id: string;
+  label: string;
+}
+
+/** The exact tool input a decision was made on — the ask block's "exact
+ * command". Mirrors the backend `core::policy::ToolInput` (pre-hook input; a
+ * user-level hook like RTK may rewrite it afterwards — an accepted fidelity
+ * caveat that never affects correlation). All agent-authored text; render it
+ * only as escaped JSX. */
+export interface HelmToolInput {
+  command?: string;
+  filePath?: string;
+}
+
+/** One Approval Inbox card, as the control-plane endpoint serializes it.
+ * Mirrors the backend `core::control_plane::ApprovalCard`. Every string is
+ * hostile agent/PTY output — render via escaped JSX only, never an HTML
+ * sink. */
+export interface HelmApproval {
+  id: string;
+  seq: number;
+  sessionId: string;
+  toolName: string;
+  toolUseId: string | null;
+  status: HelmCardStatus;
+  decision: HelmCardDecision;
+  rule?: HelmCardRule;
+  input: HelmToolInput;
+}
+
 /** Stream callbacks for a session. Output is hostile PTY data: treat it
  * as text, never as markup or instructions. */
 export interface AgentStreamHandlers {

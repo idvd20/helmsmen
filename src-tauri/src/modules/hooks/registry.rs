@@ -27,16 +27,22 @@ pub struct EndpointRegistry {
 }
 
 impl EndpointRegistry {
-    /// Start-or-get the Workspace's endpoint. Idempotent: a second call for a
-    /// Workspace that already has a live endpoint returns the same one (same
-    /// port and token), so re-entering the wiring step never orphans a
-    /// listener. Only a first, failing `bind` surfaces an error.
-    pub fn start_for(&self, workspace_id: &str) -> io::Result<Arc<ControlPlaneEndpoint>> {
+    /// Start-or-get the Workspace's endpoint, bound to its TRUSTED worktree
+    /// root (the anchor for the policy's destructive-fs rule). Idempotent: a
+    /// second call for a Workspace that already has a live endpoint returns
+    /// the same one (same port, token, and policy root), so re-entering the
+    /// wiring step never orphans a listener or rebinds the policy. Only a
+    /// first, failing `bind` surfaces an error.
+    pub fn start_for(
+        &self,
+        workspace_id: &str,
+        workspace_root: &str,
+    ) -> io::Result<Arc<ControlPlaneEndpoint>> {
         let mut map = self.lock();
         if let Some(existing) = map.get(workspace_id) {
             return Ok(Arc::clone(existing));
         }
-        let endpoint = Arc::new(ControlPlaneEndpoint::start()?);
+        let endpoint = Arc::new(ControlPlaneEndpoint::start_in(workspace_root)?);
         map.insert(workspace_id.to_string(), Arc::clone(&endpoint));
         Ok(endpoint)
     }
@@ -73,8 +79,8 @@ mod tests {
     #[test]
     fn start_for_is_idempotent_per_workspace() {
         let reg = EndpointRegistry::default();
-        let a = reg.start_for("ws-1").unwrap();
-        let b = reg.start_for("ws-1").unwrap();
+        let a = reg.start_for("ws-1", "/tmp/ws-1").unwrap();
+        let b = reg.start_for("ws-1", "/tmp/ws-1").unwrap();
         // Same endpoint: same port and token, no second listener bound.
         assert_eq!(a.port(), b.port());
         assert_eq!(a.token(), b.token());
@@ -83,8 +89,8 @@ mod tests {
     #[test]
     fn distinct_workspaces_get_distinct_endpoints() {
         let reg = EndpointRegistry::default();
-        let a = reg.start_for("ws-1").unwrap();
-        let b = reg.start_for("ws-2").unwrap();
+        let a = reg.start_for("ws-1", "/tmp/ws-1").unwrap();
+        let b = reg.start_for("ws-2", "/tmp/ws-2").unwrap();
         assert_ne!(a.port(), b.port(), "each Workspace binds its own port");
         assert_ne!(a.token(), b.token(), "per-session tokens must differ");
     }
@@ -93,14 +99,14 @@ mod tests {
     fn get_returns_the_started_endpoint_and_none_otherwise() {
         let reg = EndpointRegistry::default();
         assert!(reg.get("ws-1").is_none());
-        let started = reg.start_for("ws-1").unwrap();
+        let started = reg.start_for("ws-1", "/tmp/ws-1").unwrap();
         assert_eq!(reg.get("ws-1").unwrap().port(), started.port());
     }
 
     #[test]
     fn remove_stops_serving_and_is_idempotent() {
         let reg = EndpointRegistry::default();
-        reg.start_for("ws-1").unwrap();
+        reg.start_for("ws-1", "/tmp/ws-1").unwrap();
         reg.remove("ws-1");
         assert!(reg.get("ws-1").is_none());
         // Removing an absent id is a no-op, never a panic.
@@ -112,7 +118,7 @@ mod tests {
     fn snapshot_reads_the_endpoint_state() {
         let reg = EndpointRegistry::default();
         assert!(reg.snapshot("ws-1").is_none());
-        reg.start_for("ws-1").unwrap();
+        reg.start_for("ws-1", "/tmp/ws-1").unwrap();
         let snap = reg.snapshot("ws-1").unwrap();
         assert!(snap.cards.is_empty(), "a fresh endpoint has no cards");
     }

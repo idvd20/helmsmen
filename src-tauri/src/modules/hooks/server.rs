@@ -28,9 +28,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::modules::core::control_plane::{apply_hook_event, ControlPlaneState, HookEvent};
+use crate::modules::core::control_plane::{
+    apply_hook_event, ControlPlaneState, HookEvent, HookEventKind,
+};
+use crate::modules::core::policy::{decide, PolicyContext};
 
-use super::wire::{handle_request, Outcome, RequestParts, HOOK_PATH, MAX_BODY_BYTES};
+use super::wire::{
+    handle_request, pretooluse_permission_json, Outcome, RequestParts, HOOK_PATH, MAX_BODY_BYTES,
+};
 
 /// Cap on the request head (request line + headers). Hook requests have a
 /// handful of small headers; anything larger is refused before the body.
@@ -53,8 +58,20 @@ pub struct ControlPlaneEndpoint {
 }
 
 impl ControlPlaneEndpoint {
-    /// Bind a fresh loopback endpoint and start serving in the background.
+    /// Bind a fresh loopback endpoint whose policy has no known worktree root
+    /// (destructive-fs decisions then fail safe to an ask). Used by tests and
+    /// callers that do not scope to a Workspace; prefer [`start_in`] at cut.
+    ///
+    /// [`start_in`]: Self::start_in
     pub fn start() -> io::Result<Self> {
+        Self::start_in("")
+    }
+
+    /// Bind a fresh loopback endpoint bound to a Workspace's TRUSTED worktree
+    /// root, and start serving in the background. The root anchors the pure
+    /// policy's "destructive fs outside the worktree" rule; the home directory
+    /// is read from the process environment (the shell), never from a payload.
+    pub fn start_in(workspace_root: impl Into<String>) -> io::Result<Self> {
         // Loopback only: bind 127.0.0.1, never 0.0.0.0. Port 0 = an
         // OS-assigned ephemeral port.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
@@ -63,14 +80,18 @@ impl ControlPlaneEndpoint {
         let token = generate_token();
         let state = Arc::new(Mutex::new(ControlPlaneState::default()));
         let running = Arc::new(AtomicBool::new(true));
+        let policy = Arc::new(PolicyContext::new(workspace_root, home_dir()));
 
         let seq = Arc::new(AtomicU64::new(0));
         let loop_token = token.clone();
         let loop_state = Arc::clone(&state);
         let loop_running = Arc::clone(&running);
+        let loop_policy = Arc::clone(&policy);
         std::thread::Builder::new()
             .name("helmsmen-control-plane".to_string())
-            .spawn(move || accept_loop(listener, loop_token, loop_state, seq, loop_running))?;
+            .spawn(move || {
+                accept_loop(listener, loop_token, loop_state, seq, loop_running, loop_policy)
+            })?;
 
         Ok(Self {
             port,
@@ -122,6 +143,7 @@ fn accept_loop(
     state: Arc<Mutex<ControlPlaneState>>,
     seq: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    policy: Arc<PolicyContext>,
 ) {
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -129,12 +151,13 @@ fn accept_loop(
                 let token = token.clone();
                 let state = Arc::clone(&state);
                 let seq = Arc::clone(&seq);
+                let policy = Arc::clone(&policy);
                 // A stalled or hostile connection is isolated on its own
                 // handler; it cannot block the accept loop.
                 let spawned = std::thread::Builder::new()
                     .name("helmsmen-control-plane-conn".to_string())
                     .spawn(move || {
-                        let _ = handle_connection(stream, &token, &state, &seq);
+                        let _ = handle_connection(stream, &token, &state, &seq, &policy);
                     });
                 let _ = spawned;
             }
@@ -151,6 +174,7 @@ fn handle_connection(
     token: &str,
     state: &Mutex<ControlPlaneState>,
     seq: &AtomicU64,
+    policy: &PolicyContext,
 ) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
@@ -162,11 +186,21 @@ fn handle_connection(
             // Server-assigned monotonic sequence — stable card ids and
             // warning provenance without trusting any client-sent counter.
             let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
+            // The PreToolUse relay is SYNCHRONOUS: run the user-level policy
+            // and return the decision as the hook's response so Claude Code
+            // enforces it (ask pauses, deny blocks, allow proceeds). Every
+            // other event stays fire-and-forget.
+            let body = match &kind {
+                HookEventKind::PreToolUse {
+                    tool_name, input, ..
+                } => pretooluse_permission_json(&decide(tool_name, input, policy)),
+                _ => String::from("{\"ok\":true}"),
+            };
             let event = HookEvent::new(n, session_id, kind);
             let mut guard = state.lock().expect("control-plane state mutex poisoned");
             let current = std::mem::take(&mut *guard);
-            *guard = apply_hook_event(current, event);
-            (200u16, "OK", String::from("{\"ok\":true}"))
+            *guard = apply_hook_event(current, event, policy);
+            (200u16, "OK", body)
         }
         Outcome::Rejected(rejection) => {
             let (code, reason) = rejection.status();
@@ -278,6 +312,16 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// The user's home directory, read from the process environment (the trusted
+/// shell) — never from a hook payload. Anchors the policy's `rm $HOME` and
+/// `~/.ssh` hard-deny checks. Empty if unset (the checks then match only the
+/// textual `~` / `$HOME` forms).
+fn home_dir() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default()
+}
+
 /// Mint a 256-bit bearer token, hex-encoded. Prefers OS randomness
 /// (`/dev/urandom`); a degraded time/pid mix is the fallback if that is
 /// unavailable (documented, and not reached on the macOS/Linux targets).
@@ -364,6 +408,32 @@ mod tests {
             .nth(1)
             .and_then(|code| code.parse::<u16>().ok())
             .unwrap_or(0)
+    }
+
+    /// Like [`http_post`] but returns the response body (the JSON the
+    /// PreToolUse relay hands back to Claude Code).
+    fn http_post_body(port: u16, auth: Option<&str>, body: &str) -> String {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.set_read_timeout(Some(SOCKET_TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(SOCKET_TIMEOUT)).unwrap();
+        let auth_line = auth
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth_line}\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let text = String::from_utf8_lossy(&response);
+        // Body is everything after the blank line ending the headers.
+        text.split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default()
     }
 
     fn bearer(endpoint: &ControlPlaneEndpoint) -> String {
@@ -513,5 +583,95 @@ mod tests {
         assert_eq!(state.cards.len(), 4, "replay must not duplicate cards");
         assert_eq!(state.event_count, 28);
         assert!(state.warnings.is_empty());
+    }
+
+    // --- Test seam: the decision relay (policy -> Claude Code) at the wire ---
+
+    /// A PreToolUse POST for a risk-list call comes back with a Claude Code
+    /// `ask` decision AND lands a paused ask card carrying the rule + exact
+    /// command — the whole "risk call pauses with an ask block" AC, at the
+    /// primary seam, with no live agent.
+    #[test]
+    fn a_risk_pretooluse_returns_ask_and_lands_a_paused_ask_card() {
+        let endpoint = ControlPlaneEndpoint::start().unwrap();
+        let auth = bearer(&endpoint);
+        let body = r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
+            "tool_use_id":"toolu_fp","tool_input":{"command":"git push --force origin main"}}"#;
+
+        let resp = http_post_body(endpoint.port(), Some(&auth), body);
+        let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "ask");
+
+        let state = endpoint.snapshot();
+        let card = &state.cards[0];
+        assert_eq!(card.status, CardStatus::Pending);
+        assert_eq!(
+            card.rule.as_ref().map(|r| r.id.as_str()),
+            Some("git-history-rewrite")
+        );
+        assert_eq!(
+            card.input.command.as_deref(),
+            Some("git push --force origin main")
+        );
+        // Every decision writes a record.
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.records[0].input.command.as_deref(), Some("git push --force origin main"));
+    }
+
+    /// A hard-deny call comes back with a Claude Code `deny` decision (so the
+    /// tool never runs) and is recorded as denied — robust via the hook
+    /// return, regardless of prompt layout.
+    #[test]
+    fn a_hard_deny_pretooluse_returns_deny_and_is_recorded() {
+        let endpoint = ControlPlaneEndpoint::start().unwrap();
+        let auth = bearer(&endpoint);
+        let body = r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
+            "tool_use_id":"toolu_sudo","tool_input":{"command":"sudo rm -rf /var"}}"#;
+
+        let resp = http_post_body(endpoint.port(), Some(&auth), body);
+        let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+
+        let state = endpoint.snapshot();
+        assert_eq!(
+            state.records[0].rule.as_ref().map(|r| r.id.as_str()),
+            Some("hard-deny-sudo")
+        );
+    }
+
+    /// An ordinary in-worktree call comes back `allow` (permissive
+    /// in-worktree) and is recorded.
+    #[test]
+    fn an_ordinary_pretooluse_returns_allow() {
+        let endpoint = ControlPlaneEndpoint::start().unwrap();
+        let auth = bearer(&endpoint);
+        let body = r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
+            "tool_use_id":"toolu_ok","tool_input":{"command":"git status"}}"#;
+        let resp = http_post_body(endpoint.port(), Some(&auth), body);
+        let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(endpoint.snapshot().records[0].decision, crate::modules::core::control_plane::CardDecision::Allow);
+    }
+
+    /// The destructive-fs rule is decidable because the endpoint is bound to a
+    /// trusted worktree root: an in-tree `rm` is allowed (free), the same op
+    /// escaping the root asks.
+    #[test]
+    fn destructive_fs_is_scoped_to_the_bound_worktree_root() {
+        let root = std::env::temp_dir().join("helmsmen-wt-test");
+        let endpoint = ControlPlaneEndpoint::start_in(root.to_string_lossy()).unwrap();
+        let auth = bearer(&endpoint);
+
+        let in_tree = r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
+            "tool_use_id":"toolu_in","tool_input":{"command":"rm -rf build/output"}}"#;
+        let escape = r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
+            "tool_use_id":"toolu_out","tool_input":{"command":"rm -rf ../../etc/hosts"}}"#;
+
+        let a: serde_json::Value =
+            serde_json::from_str(&http_post_body(endpoint.port(), Some(&auth), in_tree)).unwrap();
+        assert_eq!(a["hookSpecificOutput"]["permissionDecision"], "allow");
+        let b: serde_json::Value =
+            serde_json::from_str(&http_post_body(endpoint.port(), Some(&auth), escape)).unwrap();
+        assert_eq!(b["hookSpecificOutput"]["permissionDecision"], "ask");
     }
 }
