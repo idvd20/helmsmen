@@ -13,8 +13,15 @@
 // `mountHelmOverlay` / the dev console give an interim way to open it.
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import {
+  applyLiveStatuses,
+  type HelmAgentSignal,
+  type LiveSessionStatuses,
+  reduceAgentSignal,
+} from "./agentSignal";
 import {
   createHelmApi,
   type HelmProfile,
@@ -39,6 +46,7 @@ export function HelmView({ onZoomSession }: HelmViewProps) {
   const [profiles, setProfiles] = useState<HelmProfile[]>([]);
   const [workspaces, setWorkspaces] = useState<HelmWorkspace[]>([]);
   const [facts, setFacts] = useState<Record<string, WorkspaceFacts>>({});
+  const [liveStatuses, setLiveStatuses] = useState<LiveSessionStatuses>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   // Projects and Profiles change rarely — load them once.
@@ -97,9 +105,52 @@ export function HelmView({ onZoomSession }: HelmViewProps) {
     return () => clearInterval(id);
   }, []);
 
+  // Live status (task #11): ride Terax's OSC agent-signal. The signal is
+  // data, never a command — the pure reducer folds it into a per-Session
+  // status map, overlaid onto Session facts below. This is the M2 interim
+  // SOURCE; M3's per-Workspace control-plane hooks replace it without
+  // touching the reducer (see agentSignal.ts).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let live = true;
+    let unlisten: (() => void) | undefined;
+    void listen<HelmAgentSignal>("terax:agent-signal", (event) => {
+      if (live) setLiveStatuses((prev) => reduceAgentSignal(prev, event.payload));
+    }).then((fn) => {
+      if (live) unlisten = fn;
+      else fn();
+    });
+    return () => {
+      live = false;
+      unlisten?.();
+    };
+  }, []);
+
+  // Overlay live Session statuses onto the Session facts the rollup reads.
+  // The Session list itself is populated by the zoom/attach slice (#12); #11
+  // only fills in each Session's live status, so the existing rollup lights
+  // the dot with no card or rollup change.
+  const liveFacts = useMemo<Record<string, WorkspaceFacts>>(() => {
+    if (Object.keys(liveStatuses).length === 0) return facts;
+    let changed = false;
+    const next: Record<string, WorkspaceFacts> = {};
+    for (const [id, f] of Object.entries(facts)) {
+      if (f.sessions && f.sessions.length > 0) {
+        const sessions = applyLiveStatuses(f.sessions, liveStatuses);
+        if (sessions !== f.sessions) {
+          next[id] = { ...f, sessions };
+          changed = true;
+          continue;
+        }
+      }
+      next[id] = f;
+    }
+    return changed ? next : facts;
+  }, [facts, liveStatuses]);
+
   const wall = useMemo<WallView>(
-    () => buildWall({ projects, workspaces, profiles, facts, nowMs }),
-    [projects, workspaces, profiles, facts, nowMs],
+    () => buildWall({ projects, workspaces, profiles, facts: liveFacts, nowMs }),
+    [projects, workspaces, profiles, liveFacts, nowMs],
   );
 
   return <Helm wall={wall} onZoomSession={onZoomSession} />;

@@ -99,6 +99,30 @@ wall as a full-window overlay. Promoting the Helm to a real route / the
 default home view is a later upstream integration point, deliberately left
 for when the view switch (`esc`/`t`) and repo picker (#14) land.
 
+The status dots (task #11) added **no** shared-file edit and touch **no**
+upstream module. They ride Terax's in-tree OSC agent-signal as a read-only
+SOURCE and keep the derivation in Helmsmen modules:
+
+- Terax's `modules::pty::agent_detect` (untouched) already parses hostile PTY
+  bytes into a bounded set of signal kinds and emits them on the Tauri event
+  `terax:agent-signal`. Helmsmen only _reads_ that event; it never modifies
+  the parser or the emit site (`modules::pty::session`).
+- The signal -> event -> status seam is Helmsmen-owned and pure:
+  `modules::harness::agent_signal::ingest_agent_signal` (SOURCE adapter: kind
+  string -> `core::cut::SessionSignal`, hostile-input-defensive, size-capped)
+  -> `core::cut::session_status_from_signal` -> the existing
+  `core::cut::roll_up_status`. The frontend mirrors it in
+  `src/modules/helm/agentSignal.ts` and overlays the live status onto the
+  Session facts the view-model rollup already reads — no card change.
+- **M3 swap point**: the control plane's per-Workspace hooks replace the
+  SOURCE (they emit the same `SessionSignal` per Session), leaving the
+  pure-core reducer untouched. `agent-signal` then stays the Signal-only
+  fallback for Harnesses without the `control_plane_hooks` Cap. The one open
+  seam is correlation: the interim SOURCE keys signals by a whole-terminal
+  pty id, while the Helm wall keys Sessions by their runtime session id;
+  binding a signal to a specific Workspace Session is exactly what the M3
+  per-Workspace source pins down.
+
 ## Local, non-committed state
 
 `.git/info/exclude` carries the per-clone excludes (`.pipeline/`,
