@@ -11,6 +11,7 @@
 //! store. Applying the plan is the imperative shell's job
 //! (`modules::runtime::spawn`). A guard test below enforces this.
 
+pub mod agent_signal;
 pub mod claude_code;
 pub mod commands;
 

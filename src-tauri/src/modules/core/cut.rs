@@ -217,6 +217,60 @@ pub fn derive_status(workspace: &Workspace) -> WorkspaceStatus {
     }
 }
 
+/// One Agent Session lifecycle signal, as pure-core data. Serialize-only,
+/// like [`WorkspaceStatus`]: a signal is *observed*, never accepted from
+/// stored data.
+///
+/// The M2 interim SOURCE is Terax's in-tree OSC agent-signal —
+/// `modules::pty::agent_detect` parses hostile PTY bytes into a small set
+/// of signal kinds, and `modules::harness::agent_signal` maps one kind to
+/// this event. Nothing about a `SessionSignal` executes anything: it is
+/// data that a reducer folds into a derived status.
+///
+/// # signal -> event -> status seam (the M3 swap point)
+///
+/// - **SOURCE** (`harness::agent_signal::ingest_agent_signal`, M2): OSC
+///   agent-signal, best-effort, whole-terminal.
+/// - **EVENT** (this `SessionSignal`): pure data; no side effect ever
+///   follows from its content.
+/// - **REDUCER** ([`session_status_from_signal`] then [`roll_up_status`]):
+///   folds a Session's signal into its status, then into the Workspace's.
+///
+/// At M3 the control plane's per-Workspace hooks replace the SOURCE — they
+/// emit this SAME `SessionSignal` per Session — and the reducer here is
+/// untouched. `agent_signal` then stays the Signal-only fallback for
+/// Harnesses without the control-plane-hooks Cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionSignal {
+    /// The Session's agent command was recognized and started running.
+    Started,
+    /// The agent is actively working.
+    Working,
+    /// The agent is waiting on the user ("Needs you").
+    Attention,
+    /// The agent finished its turn — output is ready to review.
+    Finished,
+    /// The Session's process exited; it no longer contributes a status.
+    Exited,
+}
+
+/// Map one [`SessionSignal`] to the [`WorkspaceStatus`] it implies for that
+/// single Session, per the PRD dot vocabulary. `Exited` yields `None`: an
+/// exited Session drops out of the rollup rather than pinning a stale dot,
+/// so with no other live Sessions the cut-derived status stands again.
+///
+/// Pure and total. This is the reducer M3 keeps; only the SOURCE feeding it
+/// changes (agent-signal now, per-Workspace control-plane hooks at M3).
+pub fn session_status_from_signal(signal: SessionSignal) -> Option<WorkspaceStatus> {
+    match signal {
+        SessionSignal::Started | SessionSignal::Working => Some(WorkspaceStatus::Working),
+        SessionSignal::Attention => Some(WorkspaceStatus::Blocked),
+        SessionSignal::Finished => Some(WorkspaceStatus::Done),
+        SessionSignal::Exited => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +556,80 @@ mod tests {
                 &[WorkspaceStatus::Done, WorkspaceStatus::Idle]
             ),
             WorkspaceStatus::Idle
+        );
+    }
+
+    // --- session-signal -> status mapping (M2 interim source, task #11) ---
+
+    #[test]
+    fn session_signals_map_to_the_prd_dot_vocabulary() {
+        assert_eq!(
+            session_status_from_signal(SessionSignal::Started),
+            Some(WorkspaceStatus::Working)
+        );
+        assert_eq!(
+            session_status_from_signal(SessionSignal::Working),
+            Some(WorkspaceStatus::Working)
+        );
+        assert_eq!(
+            session_status_from_signal(SessionSignal::Attention),
+            Some(WorkspaceStatus::Blocked)
+        );
+        assert_eq!(
+            session_status_from_signal(SessionSignal::Finished),
+            Some(WorkspaceStatus::Done)
+        );
+        assert_eq!(session_status_from_signal(SessionSignal::Exited), None);
+    }
+
+    #[test]
+    fn a_live_session_signal_lights_the_dot_through_the_existing_rollup() {
+        // The whole M2 seam at the pure level: a "working" signal on a
+        // completed (idle) cut rolls the Workspace up to Working.
+        let working = session_status_from_signal(SessionSignal::Working).unwrap();
+        assert_eq!(
+            roll_up_status(WorkspaceStatus::Idle, &[working]),
+            WorkspaceStatus::Working
+        );
+        // "attention" parks it in Needs you regardless of the cut status.
+        let attention = session_status_from_signal(SessionSignal::Attention).unwrap();
+        assert_eq!(
+            roll_up_status(WorkspaceStatus::Idle, &[attention]),
+            WorkspaceStatus::Blocked
+        );
+        // "finished" surfaces it as To review.
+        let finished = session_status_from_signal(SessionSignal::Finished).unwrap();
+        assert_eq!(
+            roll_up_status(WorkspaceStatus::Idle, &[finished]),
+            WorkspaceStatus::Done
+        );
+    }
+
+    #[test]
+    fn an_exited_session_contributes_no_status_and_falls_back_to_the_cut() {
+        // Exited maps to None, so it never enters the rollup slice; with no
+        // other live Sessions the cut-derived status stands (never a stale
+        // Working/Done left pinned by a dead process).
+        assert_eq!(session_status_from_signal(SessionSignal::Exited), None);
+        assert_eq!(
+            roll_up_status(WorkspaceStatus::Idle, &[]),
+            WorkspaceStatus::Idle
+        );
+    }
+
+    #[test]
+    fn session_signals_serialize_camel_case_for_the_frontend_mirror() {
+        assert_eq!(
+            serde_json::to_value(SessionSignal::Started).unwrap(),
+            serde_json::json!("started")
+        );
+        assert_eq!(
+            serde_json::to_value(SessionSignal::Attention).unwrap(),
+            serde_json::json!("attention")
+        );
+        assert_eq!(
+            serde_json::to_value(SessionSignal::Finished).unwrap(),
+            serde_json::json!("finished")
         );
     }
 }
