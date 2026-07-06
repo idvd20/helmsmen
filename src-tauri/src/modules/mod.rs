@@ -4,6 +4,7 @@ pub mod fs;
 pub mod git;
 pub mod harness;
 pub mod history;
+pub mod hooks;
 pub mod net;
 pub mod proc;
 pub mod pty;

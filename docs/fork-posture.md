@@ -52,7 +52,7 @@ The only Terax files Helmsmen may edit. Grow this list deliberately; anything
 not listed is upstream's territory.
 
 - `src-tauri/src/modules/mod.rs` — module declarations for the new Helmsmen
-  backend modules (`core`, `registry`, `runtime`, `harness`; later `hooks`).
+  backend modules (`core`, `registry`, `runtime`, `harness`, `hooks`).
 - `src-tauri/src/lib.rs` — registration only: manage
   `registry::RegistryState` in `.setup()`, manage `runtime::RuntimeState`,
   and list the `helm_*` commands in `invoke_handler` (tasks #4, #5, #6;
@@ -144,6 +144,41 @@ Promoting the zoom to a real app-shell route — and giving the wall a card
 cursor so `↵` zooms a *selected* card (it currently zooms the first
 zoomable Workspace) — is a later upstream integration point, left for when
 the view switch and wall keyboard-nav land.
+
+The control plane (task #15, M3 backend half) added **no** upstream Terax
+edit and **no** new crate. It lives in two new Helmsmen modules:
+
+- `modules::hooks` (imperative shell): a per-Workspace, loopback-only HTTP
+  endpoint (`server.rs`) with a per-session bearer token and a pure request
+  boundary (`wire.rs` — token check, size cap, typed parse; all unit-tested
+  with zero I/O). It is built on `std::net` blocking sockets **on purpose**:
+  no HTTP-server crate joins the tree, so `cargo-deny`'s Apache-2.0 license
+  gate and the upstream `hyper`/`tokio` stack are both left untouched. The
+  endpoint binds `127.0.0.1:0`; a process that discovers the port but not the
+  token can inject nothing (rejected `401`), and oversized bodies are capped
+  before parsing (`413`).
+- `modules::core::control_plane` (pure core): the event→transition reducer,
+  lifted from `spike-approval-loop/correlate.js` (verdict PASS). Same card
+  lifecycle (`Pending→Surfaced→Allowed→ClosedNoRun`), same strict
+  `tool_use_id` correlation, same "a permission `Notification` is status-only,
+  never sources a card" rule — with the spike's one residual ambiguity
+  removed: a permission prompt surfaces *every* pending card in the session
+  (no oldest-pending guess), so the captured multi-call corpus replays to
+  zero warnings (the criterion-4 pass signal). It keeps the pure-core purity
+  guard (`modules::registry::pure_core_has_no_io_imports`) green — no network,
+  async, or process imports.
+
+This is the **M3 replacement SOURCE** for the M2 agent-signal seam that
+task #11 left open: `control_plane::hook_event_signal` maps each event to the
+same `core::cut::SessionSignal`, feeding the unchanged
+`session_status_from_signal` + `roll_up_status` reducer. The two sources
+coexist during the M2→M3 swap. **Test seam 1** (synthetic hook events at the
+endpoint prove hook-POST→card render with no live agent) is realized by the
+corpus suites in both new modules. Deliberately **not** in this slice: the
+hook config written into the cut worktree (task #16 consumes
+`ControlPlaneEndpoint::{port, token, url}`), so `lib.rs` is untouched — the
+endpoint is per-Workspace, spawned by the cut pipeline, not an app-boot
+singleton.
 
 ## Local, non-committed state
 
