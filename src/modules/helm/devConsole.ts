@@ -48,12 +48,16 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import {
+  mountQuarterdeck,
+  unmountQuarterdeck,
+} from "@/modules/workspaces/Quarterdeck";
+import { sessionStore } from "@/modules/workspaces/sessionStore";
+import {
   type ChannelFactory,
   createHelmApi,
   type HelmAgentSession,
   type SpawnAgentOptions,
 } from "./api";
-import { mountHelmOverlay, unmountHelmOverlay } from "./HelmView";
 import { openStreamView } from "./streamView";
 
 const makeChannel: ChannelFactory = <T>(onMessage: (message: T) => void) => {
@@ -65,28 +69,34 @@ const makeChannel: ChannelFactory = <T>(onMessage: (message: T) => void) => {
 function createDevConsole() {
   const api = createHelmApi(invoke, makeChannel);
 
-  /** Spawn with a visible stream view attached — the one-call demo path. */
+  /** Spawn with a visible stream view attached — the one-call demo path.
+   * The returned handle is also registered in the zoom's Session store so
+   * the Workspace can be zoomed into (task #12; interim until Session facts
+   * land on the wall). */
   const spawnAgentView = async (
     workspaceId: string,
     opts: SpawnAgentOptions = {},
   ): Promise<HelmAgentSession> => {
     const view = openStreamView(`agent @ ${workspaceId}`);
     try {
-      return await api.spawnAgent(workspaceId, {
+      const session = await api.spawnAgent(workspaceId, {
         onData: (bytes) => view.write(bytes),
         onExit: (code) => view.exit(code),
         ...opts,
       });
+      sessionStore.register(session);
+      return session;
     } catch (error) {
       view.close();
       throw error;
     }
   };
 
-  /** Open the Helm wall as a full-window overlay (the M2 home view).
-   * `helmsmen.openHelm()` / `helmsmen.closeHelm()` from the console. */
-  const openHelm = () => mountHelmOverlay();
-  const closeHelm = () => unmountHelmOverlay();
+  /** Open the quarterdeck — the Helm wall plus the Zoom it opens onto (the
+   * M2 home view). `helmsmen.openHelm()` / `helmsmen.closeHelm()` from the
+   * console; Session chips (and `↵` on the wall) zoom in, Esc returns. */
+  const openHelm = () => mountQuarterdeck();
+  const closeHelm = () => unmountQuarterdeck();
 
   return { ...api, spawnAgentView, openHelm, closeHelm };
 }

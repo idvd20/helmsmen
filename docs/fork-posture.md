@@ -123,6 +123,28 @@ SOURCE and keep the derivation in Helmsmen modules:
   binding a signal to a specific Workspace Session is exactly what the M3
   per-Workspace source pins down.
 
+The Zoom / "take the wheel" view (task #12) added **no** upstream Terax
+edit. It lives entirely in the new `src/modules/workspaces` module: pure,
+tested navigation logic (`keymap.ts` — key→action map, tab-index and
+`[`/`]` hop math; `zoomModel.ts` — Session→tab projection, zoom-target
+resolution, message-line) and the React shell over it (`Zoom.tsx`,
+`PtyPane.tsx`, `Quarterdeck.tsx`). The PTY pane reuses the helm module's
+safe rendering path (hostile bytes → `createStreamBuffer` → `textContent`
+only) and the backend runtime **unchanged**: attach-on-zoom is the existing
+`helm_attach_agent` (scrollback replays, then live), and `m`'s line-to-PTY
+is the existing `helm_write_agent` — both already pinned by the runtime
+conformance suite (`case_attach_replays_scrollback_then_streams`,
+`case_write_reaches_stdin`). The **only** helm-module edit was the
+container-level wiring the #10 seam left for it: `devConsole.ts`'s
+`openHelm()`/`closeHelm()` now mount the quarterdeck (wall + zoom) instead
+of the bare wall, and `spawnAgentView` registers each spawn in the interim
+`sessionStore` so a Workspace can be zoomed into before Session facts land
+on the wall. No status-dot / Session-facts render code (#11's) was touched.
+Promoting the zoom to a real app-shell route — and giving the wall a card
+cursor so `↵` zooms a *selected* card (it currently zooms the first
+zoomable Workspace) — is a later upstream integration point, left for when
+the view switch and wall keyboard-nav land.
+
 ## Local, non-committed state
 
 `.git/info/exclude` carries the per-clone excludes (`.pipeline/`,
