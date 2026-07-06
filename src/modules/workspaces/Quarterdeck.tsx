@@ -151,7 +151,12 @@ export function Quarterdeck({ api }: QuarterdeckProps) {
 
   return (
     <>
-      <HelmView onZoomSession={openZoom} />
+      {/* The wall's `f`/`g`/`r` keys yield while an overlay owns the
+          keyboard — same gate the `n`/`↵` wall keys use above. */}
+      <HelmView
+        onZoomSession={openZoom}
+        keyboardActive={zoom === null && !newWorkspaceOpen}
+      />
       {zoom ? (
         <Zoom
           api={api}
