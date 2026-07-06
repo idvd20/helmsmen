@@ -177,43 +177,46 @@ fn collapse_ws(s: &str) -> String {
 }
 
 /// A line is dialog chrome — the prompt/options/footer that sit BELOW the
-/// command in a Claude Code permission dialog. Used to anchor the command
-/// match: the intended command must be the row(s) directly above this chrome,
-/// not a stray line elsewhere. Matched case-insensitively (layout copy).
+/// command in a Claude Code permission dialog (the prompt/options/footer that
+/// sit BELOW the command block). Used to bound the command region: the intended
+/// command must be a row above this chrome, not a stray line elsewhere. Matched
+/// case-insensitively (layout copy). `requires confirmation` is the hook-forced
+/// dialog's first chrome line on a live CC 2.1.x screen (verified against a real
+/// `claude`), above the `Do you want to proceed?` / `1. Yes` / footer rows.
 fn is_chrome_line(line_lower: &str) -> bool {
     DIALOG_MARKERS.iter().any(|m| line_lower.contains(m)) || line_lower.contains("requires confirmation")
 }
 
-/// The first non-blank line at or below `idx` is dialog chrome. A command with
-/// nothing (or non-chrome) below it is not an active dialog — fail safe.
-fn next_is_chrome(lines: &[String], mut idx: usize) -> bool {
-    while idx < lines.len() && lines[idx].is_empty() {
-        idx += 1;
-    }
-    lines.get(idx).is_some_and(|line| is_chrome_line(&line.to_lowercase()))
-}
-
 /// Is `want` the command of the dialog currently on screen? True iff some run
-/// of consecutive non-blank visible lines collapses to EXACTLY `want`
-/// (case-sensitive) AND is immediately followed by dialog chrome. Exact
-/// equality defeats the substring/prefix hazard — a card command that is only
-/// a prefix of a longer, more dangerous live command ("git push" vs the
-/// on-screen "git push --force origin main") never matches. The multi-line run
-/// tolerates a soft-wrapped command; the chrome anchor ties the match to the
-/// active dialog. Any layout the extractor doesn't recognize yields no match →
-/// [`Mismatch::DialogNotVisible`] (fail safe, never a mis-injection).
+/// of consecutive non-blank visible lines ABOVE the dialog's chrome collapses
+/// to EXACTLY `want` (case-sensitive). Exact equality defeats the
+/// substring/prefix hazard — a card command that is only a prefix of a longer,
+/// more dangerous live command ("git push" vs the on-screen "git push --force
+/// origin main") never matches. The multi-line run tolerates a soft-wrapped
+/// command; restricting to the region above the chrome keeps the match anchored
+/// to the dialog's command block and tolerates the description line CC renders
+/// between the command and the prompt (verified live). The snapshot is the
+/// current visible screen, so history/queued-underneath commands are not
+/// present. Any layout that yields no exact-line match → DialogNotVisible (fail
+/// safe, never a mis-injection).
 fn command_is_on_screen(lines: &[String], want: &str) -> bool {
-    for start in 0..lines.len() {
+    // The command sits above the prompt/options; everything from the first
+    // chrome line down is dialog furniture, not the command.
+    let region_end = lines
+        .iter()
+        .position(|line| is_chrome_line(&line.to_lowercase()))
+        .unwrap_or(lines.len());
+    for start in 0..region_end {
         if lines[start].is_empty() {
             continue;
         }
         let mut run: Vec<&str> = Vec::new();
-        for line in &lines[start..] {
+        for line in &lines[start..region_end] {
             if line.is_empty() {
                 break; // a command is contiguous — don't span a blank row
             }
             run.push(line);
-            if collapse_ws(&run.join(" ")) == want && next_is_chrome(lines, start + run.len()) {
+            if collapse_ws(&run.join(" ")) == want {
                 return true;
             }
         }
@@ -413,6 +416,38 @@ mod tests {
         let screen = dialog_screen("rm -rf build/../../etc");
         let err = allow(&screen, "rm -rf build").unwrap_err();
         assert_eq!(err, Mismatch::DialogNotVisible, "a substring is not the same command");
+    }
+
+    /// The real CC 2.1.x hook-forced dialog (captured live): the command is
+    /// followed by a human DESCRIPTION line and the multi-line hook reason
+    /// before the prompt — the command is not immediately adjacent to the
+    /// chrome. The match must still find it (anchored to the region above the
+    /// chrome), and must still reject a mere prefix.
+    fn live_layout_screen(command: &str) -> Vec<u8> {
+        format!(
+            "\x1b[2J\x1b[H Bash command\r\n\r\n  \x1b[36m{command}\x1b[0m\r\n  \
+             Amend the last commit keeping the same message\r\n\r\n \
+             Hook PreToolUse:Bash requires confirmation for this command:\r\n \
+             Helmsmen: git history rewrite \u{2014} approval required\r\n\r\n \
+             Do you want to proceed?\r\n \x1b[7m 1. Yes \x1b[0m\r\n   2. No\r\n\r\n \
+             Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain",
+            command = command
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn live_dialog_with_a_description_line_still_matches_the_command() {
+        let screen = live_layout_screen("git commit --amend --no-edit");
+        let steps = allow(&screen, "git commit --amend --no-edit").unwrap();
+        assert_eq!(steps, vec![KeyStep::Inject(b"1".to_vec())]);
+    }
+
+    #[test]
+    fn live_dialog_still_rejects_a_prefix_of_the_command() {
+        let screen = live_layout_screen("git commit --amend --no-edit");
+        let err = allow(&screen, "git commit").unwrap_err();
+        assert_eq!(err, Mismatch::DialogNotVisible);
     }
 
     #[test]

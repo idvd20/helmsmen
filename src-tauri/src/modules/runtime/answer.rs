@@ -477,10 +477,23 @@ mod live {
         let expected = "git commit --amend --no-edit";
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut saw_dialog = false;
+        let mut trusted = false;
         while Instant::now() < deadline {
             let screen = rt.snapshot(&session).unwrap_or_default();
             let text = String::from_utf8_lossy(&screen).to_lowercase();
-            if text.contains("esc to cancel") || text.contains("do you want to proceed") {
+            // A fresh temp worktree triggers the one-time workspace trust
+            // prompt; accept it (option 1 is pre-highlighted → Enter) so the
+            // tool call can proceed to its permission dialog.
+            if !trusted && text.contains("trust this folder") {
+                let _ = rt.write(&session, b"\r");
+                trusted = true;
+                std::thread::sleep(Duration::from_millis(1000));
+                continue;
+            }
+            // The permission dialog specifically — "requires confirmation" is
+            // its first chrome line; the trust prompt above also shows
+            // "esc to cancel", so match on the confirmation copy, not that.
+            if text.contains("requires confirmation") || text.contains("do you want to proceed") {
                 saw_dialog = true;
                 break;
             }
