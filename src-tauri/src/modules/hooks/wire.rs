@@ -16,6 +16,7 @@
 use serde::Deserialize;
 
 use crate::modules::core::control_plane::{HookEventKind, NotificationKind};
+use crate::modules::core::policy::{Decision, ToolInput};
 
 /// The one path the endpoint answers. Everything else is a 404 (after auth).
 pub const HOOK_PATH: &str = "/hook";
@@ -145,6 +146,60 @@ struct HookPayload {
     tool_use_id: Option<String>,
     #[serde(default)]
     notification_type: Option<String>,
+    /// The tool call's input. Only the fields the pure policy reasons over
+    /// (`command`, `file_path`) are lifted out; every other key is ignored as
+    /// data. A missing or mistyped `tool_input` yields an empty [`ToolInput`],
+    /// never a rejection.
+    #[serde(default)]
+    tool_input: Option<RawToolInput>,
+}
+
+/// The lenient DTO for a PreToolUse `tool_input`. Both fields optional so a
+/// hostile or partial object degrades to an empty policy input rather than a
+/// parse error.
+#[derive(Debug, Deserialize)]
+struct RawToolInput {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    file_path: Option<String>,
+}
+
+fn to_tool_input(raw: Option<RawToolInput>) -> ToolInput {
+    match raw {
+        Some(raw) => ToolInput {
+            command: raw.command,
+            file_path: raw.file_path,
+        },
+        None => ToolInput::default(),
+    }
+}
+
+/// Serialize a policy [`Decision`] into the Claude Code PreToolUse hook
+/// response — the JSON the synchronous relay prints to stdout so Claude Code
+/// enforces the decision (`ask` pauses, `deny` blocks, `allow` proceeds).
+/// This is the wire shape of the decision seam; it is pure, so the mapping is
+/// unit-tested here.
+pub fn pretooluse_permission_json(decision: &Decision) -> String {
+    let (permission, reason) = match decision {
+        Decision::Allow => (
+            "allow",
+            "Helmsmen: allowed (permissive in-worktree)".to_string(),
+        ),
+        Decision::Ask(rule) => (
+            "ask",
+            format!("Helmsmen: {} — approval required", rule.label()),
+        ),
+        Decision::Deny(rule) => ("deny", format!("Helmsmen: {} — blocked", rule.label())),
+    };
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": permission,
+            "permissionDecisionReason": reason,
+        }
+    })
+    .to_string()
 }
 
 /// Parse error kinds. Both currently collapse to a 400 for the client; kept
@@ -172,6 +227,7 @@ pub fn parse_hook_event(body: &[u8]) -> Result<(String, HookEventKind), ParseErr
         "PreToolUse" => HookEventKind::PreToolUse {
             tool_use_id: payload.tool_use_id,
             tool_name: payload.tool_name.unwrap_or_default(),
+            input: to_tool_input(payload.tool_input),
         },
         "PostToolUse" => HookEventKind::PostToolUse {
             tool_use_id: payload.tool_use_id,
@@ -219,7 +275,7 @@ mod tests {
     // --- parse: the corpus event shapes ---
 
     #[test]
-    fn parses_pretooluse_with_tool_use_id() {
+    fn parses_pretooluse_with_tool_use_id_and_lifts_the_command() {
         let body = br#"{"session_id":"s1","hook_event_name":"PreToolUse",
             "tool_name":"Bash","tool_use_id":"toolu_x","tool_input":{"command":"ls"}}"#;
         let (sid, kind) = parse_hook_event(body).unwrap();
@@ -229,8 +285,59 @@ mod tests {
             HookEventKind::PreToolUse {
                 tool_use_id: Some("toolu_x".to_string()),
                 tool_name: "Bash".to_string(),
+                input: ToolInput::command("ls"),
             }
         );
+    }
+
+    #[test]
+    fn lifts_file_path_and_tolerates_a_missing_tool_input() {
+        let body = br#"{"session_id":"s1","hook_event_name":"PreToolUse",
+            "tool_name":"Read","tool_use_id":"toolu_y","tool_input":{"file_path":"/x/.env"}}"#;
+        let (_sid, kind) = parse_hook_event(body).unwrap();
+        assert_eq!(
+            kind,
+            HookEventKind::PreToolUse {
+                tool_use_id: Some("toolu_y".to_string()),
+                tool_name: "Read".to_string(),
+                input: ToolInput::file_path("/x/.env"),
+            }
+        );
+        // A PreToolUse without any tool_input degrades to an empty input.
+        let body = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"z"}"#;
+        let (_sid, kind) = parse_hook_event(body).unwrap();
+        assert_eq!(
+            kind,
+            HookEventKind::PreToolUse {
+                tool_use_id: Some("z".to_string()),
+                tool_name: "Bash".to_string(),
+                input: ToolInput::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn permission_json_maps_each_decision_to_the_claude_code_shape() {
+        use crate::modules::core::policy::{DenyRule, RiskRule};
+        use serde_json::Value;
+
+        let parse = |d: &Decision| -> Value {
+            serde_json::from_str(&pretooluse_permission_json(d)).unwrap()
+        };
+
+        let allow = parse(&Decision::Allow);
+        assert_eq!(allow["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(allow["hookSpecificOutput"]["permissionDecision"], "allow");
+
+        let ask = parse(&Decision::Ask(RiskRule::GitHistoryRewrite));
+        assert_eq!(ask["hookSpecificOutput"]["permissionDecision"], "ask");
+        assert!(ask["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("git history rewrite"));
+
+        let deny = parse(&Decision::Deny(DenyRule::Sudo));
+        assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
     #[test]

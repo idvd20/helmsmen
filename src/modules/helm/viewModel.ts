@@ -16,6 +16,7 @@
 import {
   deriveWorkspaceStatus,
   HELM_STATUS_ALIAS,
+  type HelmApproval,
   type HelmCutState,
   type HelmCutStep,
   type HelmProfile,
@@ -67,11 +68,27 @@ export interface SessionChipView {
 
 export type VerifyState = "passed" | "none" | "unknown";
 
-/** The card body, shaped by status. Blocked = the ask block (a
- * placeholder now; the approval ask renders fully at M3.5, the verify
- * badge at M6). Working/Idle = latest activity lines. Done = diffstat. */
+/** One paused approval, distilled for the ask block on the card (task #17):
+ * the tool, the rule that fired, and the exact command. Every field is
+ * hostile agent text — the card renders it via escaped JSX only. */
+export interface ApprovalAskView {
+  /** Stable card id (the correlation anchor; the answer path keys on it). */
+  id: string;
+  /** The tool that paused, e.g. `Bash`. */
+  tool: string;
+  /** The human label of the risk rule that fired. */
+  rule: string;
+  /** The exact command (or file path) the decision was made on. */
+  command: string;
+}
+
+/** The card body, shaped by status. Blocked = the ask block: the M3.5
+ * approval ask(s) when a risky call is paused, else the cut-failure /
+ * placeholder ask. Working/Idle = latest activity lines. Done = diffstat
+ * (verify badge at M6). */
 export type CardBody =
   | { kind: "ask"; prompt: string; step: string | null; log: string | null }
+  | { kind: "approval"; asks: ApprovalAskView[] }
   | { kind: "activity"; lines: string[] }
   | {
       kind: "diffstat";
@@ -80,6 +97,28 @@ export type CardBody =
       removed: number;
       verify: VerifyState;
     };
+
+/** The still-open approvals a permission answer is waiting on: only the
+ * policy `ask` cards (allow/deny are the audit trail, never ask blocks) that
+ * have not yet resolved (pending/surfaced). Pure and total; safe on an
+ * absent/empty list. Kept in incoming (seq) order. */
+export function deriveApprovalAsks(
+  approvals: HelmApproval[] | undefined,
+): ApprovalAskView[] {
+  if (!approvals) return [];
+  return approvals
+    .filter(
+      (a) =>
+        a.decision === "ask" &&
+        (a.status === "pending" || a.status === "surfaced"),
+    )
+    .map((a) => ({
+      id: a.id,
+      tool: a.toolName,
+      rule: a.rule?.label ?? "risk-list rule",
+      command: a.input.command ?? a.input.filePath ?? "",
+    }));
+}
 
 /** Host-supplied facts a Workspace card needs beyond the core entity
  * (which carries no timestamps or Session list at M2). Everything is
@@ -93,6 +132,10 @@ export interface WorkspaceFacts {
   activityLines?: string[];
   diffstat?: { files: number; added: number; removed: number };
   verify?: VerifyState;
+  /** The Workspace's control-plane approval cards (task #17). A pending
+   * `ask` among them pauses the Workspace: it forces Blocked and renders the
+   * ask block. Snapshot of `EndpointRegistry::snapshot(workspaceId)`. */
+  approvals?: HelmApproval[];
 }
 
 export interface WorkspaceCardView {
@@ -193,17 +236,23 @@ interface CardBodyFacts {
   activityLines?: string[];
   diffstat?: { files: number; added: number; removed: number };
   verify?: VerifyState;
+  /** Still-open approval asks (from [`deriveApprovalAsks`]). A non-empty
+   * list turns a Blocked body into the approval ask block. */
+  approvalAsks?: ApprovalAskView[];
 }
 
-/** The card body for a derived status. Blocked bodies born from a failed
- * cut surface the failing step and its (hostile) log; other blocked
- * bodies are the approval placeholder until M3.5. */
+/** The card body for a derived status. A Blocked body prefers the approval
+ * ask block (a risky call paused, task #17); else a failed cut surfaces the
+ * failing step and its (hostile) log; else the waiting placeholder. */
 export function deriveCardBody(
   status: HelmWorkspaceStatus,
   facts: CardBodyFacts,
 ): CardBody {
   switch (status) {
     case "blocked": {
+      if (facts.approvalAsks && facts.approvalAsks.length > 0) {
+        return { kind: "approval", asks: facts.approvalAsks };
+      }
       if (facts.cut.phase === "failed") {
         const step = CUT_STEP_LABEL[facts.cut.step];
         return {
@@ -215,7 +264,7 @@ export function deriveCardBody(
       }
       return {
         kind: "ask",
-        prompt: "waiting on you — approval renders at M3.5",
+        prompt: "waiting on you",
         step: null,
         log: null,
       };
@@ -297,7 +346,13 @@ export function buildWall(input: WallInput): WallView {
     const sessionStatuses = sessions
       .map((s) => s.status)
       .filter((s): s is HelmWorkspaceStatus => s != null);
-    const status = rollUpStatus(cutStatus, sessionStatuses);
+    const rolledUp = rollUpStatus(cutStatus, sessionStatuses);
+
+    // A paused approval (a risk-list `ask`) blocks the Workspace regardless of
+    // the rolled-up session status — the agent is waiting on the decision.
+    const approvalAsks = deriveApprovalAsks(f.approvals);
+    const status: HelmWorkspaceStatus =
+      approvalAsks.length > 0 ? "blocked" : rolledUp;
 
     return {
       workspaceId: workspace.id,
@@ -321,6 +376,7 @@ export function buildWall(input: WallInput): WallView {
         activityLines: f.activityLines,
         diffstat: f.diffstat,
         verify: f.verify,
+        approvalAsks,
       }),
       chips: sessions.map((s) => ({
         sessionId: s.sessionId,

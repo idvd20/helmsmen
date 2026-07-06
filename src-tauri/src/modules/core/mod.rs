@@ -9,6 +9,7 @@
 
 pub mod control_plane;
 pub mod cut;
+pub mod policy;
 pub mod profile;
 pub mod project;
 pub mod session;

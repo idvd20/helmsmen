@@ -22,6 +22,18 @@
 //! anything the payload contains, and the endpoint ([`super::wire`]) typed-
 //! parses the body — a payload can change status/inbox state but never
 //! executes.
+//!
+//! # PreToolUse is the SYNCHRONOUS decision relay (task #17)
+//!
+//! `PreToolUse` is special: instead of firing and forgetting, its command
+//! forwards the event and prints the endpoint's response — the Claude Code
+//! permission decision (`ask` / `deny` / `allow`, computed by the pure
+//! [`policy`](crate::modules::core::policy)) — to stdout, so Claude Code
+//! ENFORCES it. Hard-deny is thereby robust regardless of the agent's prompt
+//! layout. If the endpoint is unreachable, the relay prints nothing and exits
+//! 0, so Claude Code falls through to its own permission flow (never
+//! auto-allowing). The other three hooks stay fire-and-forget as #16 wrote
+//! them (their output is status/inbox data only).
 
 use serde_json::json;
 
@@ -30,23 +42,23 @@ use serde_json::json;
 /// merged with, never a replacement for, the user's and repo's hook sources.
 pub const CLAUDE_HOOK_SETTINGS_REL: &str = ".claude/settings.local.json";
 
-/// The Claude Code hook events wired to the control plane — exactly the set
-/// `hooks::wire::parse_hook_event` accepts and `core::control_plane` reduces.
-const WIRED_EVENTS: [&str; 4] = ["PreToolUse", "PostToolUse", "Notification", "Stop"];
+/// The fire-and-forget events (status / inbox signals only). `PreToolUse` is
+/// wired separately as the synchronous decision relay.
+const FIRE_AND_FORGET_EVENTS: [&str; 3] = ["PostToolUse", "Notification", "Stop"];
 
-/// The fire-and-forget POST each wired hook runs. Claude Code pipes the hook
-/// event JSON to the command's stdin; `--data-binary @-` forwards it verbatim
-/// to the loopback endpoint under the bearer token. Everything is bounded and
-/// silent so a hook never stalls or blocks the agent:
+/// The fire-and-forget POST a status/inbox hook runs. Claude Code pipes the
+/// hook event JSON to the command's stdin; `--data-binary @-` forwards it
+/// verbatim to the loopback endpoint under the bearer token. Everything is
+/// bounded and silent so a hook never stalls or blocks the agent:
 ///
 /// - `-m 5` caps the whole request (a dead endpoint can't hang a tool call);
 /// - `>/dev/null 2>&1` keeps hook output from ever feeding back into Claude;
-/// - `|| true` forces exit 0 so a failed POST never blocks a `PreToolUse`.
+/// - `|| true` forces exit 0 so a failed POST never blocks the agent.
 ///
 /// `url` is `http://127.0.0.1:<port>/hook` and `token` is 64 hex chars, so
 /// neither carries a shell metacharacter; single-quoting keeps them inert
 /// regardless, and `serde_json` escapes the whole string for the JSON file.
-fn post_command(url: &str, token: &str) -> String {
+fn fire_and_forget_command(url: &str, token: &str) -> String {
     format!(
         "curl -sS -m 5 -X POST \
          -H 'Authorization: Bearer {token}' \
@@ -55,18 +67,41 @@ fn post_command(url: &str, token: &str) -> String {
     )
 }
 
-/// Compose the settings JSON that POSTs every [`WIRED_EVENTS`] hook to the
-/// per-Workspace loopback endpoint at `url`, authenticated with `token`.
+/// The SYNCHRONOUS `PreToolUse` relay. Same authenticated POST, but its
+/// stdout (the endpoint's permission-decision JSON) is NOT suppressed — Claude
+/// Code reads it and enforces the decision. Only stderr is dropped, and a
+/// failed/timed-out POST falls back to empty stdout + exit 0, so Claude Code
+/// applies its own permission flow rather than the tool auto-running.
+fn pre_tool_use_command(url: &str, token: &str) -> String {
+    format!(
+        "curl -sS -m 5 -X POST \
+         -H 'Authorization: Bearer {token}' \
+         -H 'Content-Type: application/json' \
+         --data-binary @- '{url}' 2>/dev/null || true"
+    )
+}
+
+fn command_group(command: String) -> serde_json::Value {
+    json!([ { "hooks": [ { "type": "command", "command": command } ] } ])
+}
+
+/// Compose the settings JSON wiring the control-plane hooks to the
+/// per-Workspace loopback endpoint at `url`, authenticated with `token`:
+/// `PreToolUse` as the synchronous decision relay, the other three as
+/// fire-and-forget status/inbox POSTs.
 ///
 /// The shape is Claude Code's `hooks` settings object: each event maps to a
 /// list of matcher groups, each group a list of `command` hooks. No matcher
 /// is set, so the hook fires for every tool / notification.
 pub fn claude_code_hook_settings(url: &str, token: &str) -> String {
-    let command = post_command(url, token);
-    let group = json!([ { "hooks": [ { "type": "command", "command": command } ] } ]);
     let mut hooks = serde_json::Map::new();
-    for event in WIRED_EVENTS {
-        hooks.insert(event.to_string(), group.clone());
+    hooks.insert(
+        "PreToolUse".to_string(),
+        command_group(pre_tool_use_command(url, token)),
+    );
+    let fire = command_group(fire_and_forget_command(url, token));
+    for event in FIRE_AND_FORGET_EVENTS {
+        hooks.insert(event.to_string(), fire.clone());
     }
     let root = json!({ "hooks": hooks });
     // Pretty + trailing newline: this is a config file a human may open.
@@ -97,13 +132,17 @@ mod tests {
         assert_eq!(keys, ["Notification", "PostToolUse", "PreToolUse", "Stop"]);
     }
 
+    fn command_for<'a>(s: &'a Value, event: &str) -> &'a str {
+        s["hooks"][event][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no command for {event}"))
+    }
+
     #[test]
     fn each_hook_posts_to_the_endpoint_with_the_bearer_token() {
         let s = settings(URL, TOKEN);
-        for event in WIRED_EVENTS {
-            let command = s["hooks"][event][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap_or_else(|| panic!("no command for {event}"));
+        for event in ["PreToolUse", "PostToolUse", "Notification", "Stop"] {
+            let command = command_for(&s, event);
             assert!(command.contains(URL), "{event} must POST to the endpoint url");
             assert!(
                 command.contains(&format!("Authorization: Bearer {TOKEN}")),
@@ -111,17 +150,39 @@ mod tests {
             );
             // Forwards the hook's stdin verbatim — the event JSON is DATA.
             assert!(command.contains("--data-binary @-"), "{event} forwards stdin");
+            assert!(command.contains("-m 5"), "{event} POST is time-bounded");
+            assert!(command.contains("|| true"), "{event} exits 0 on failure");
             assert_eq!(s["hooks"][event][0]["hooks"][0]["type"], "command");
         }
     }
 
     #[test]
-    fn a_failed_post_never_blocks_the_agent() {
-        let command = super::post_command(URL, TOKEN);
-        assert!(command.contains("|| true"), "hook must exit 0 on failure");
-        assert!(command.ends_with("|| true"));
-        assert!(command.contains(">/dev/null 2>&1"), "hook output is suppressed");
-        assert!(command.contains("-m 5"), "the POST is time-bounded");
+    fn pretooluse_is_a_synchronous_relay_that_returns_the_decision_to_claude() {
+        let s = settings(URL, TOKEN);
+        let pre = command_for(&s, "PreToolUse");
+        // Its stdout (the endpoint's decision JSON) must NOT be suppressed —
+        // Claude Code reads it to enforce ask/deny/allow. The fire-and-forget
+        // stdout-suppressing form (`>/dev/null 2>&1`) must be absent.
+        assert!(
+            !pre.contains(">/dev/null 2>&1"),
+            "PreToolUse must NOT swallow stdout: {pre}"
+        );
+        assert!(!pre.contains(" >/dev/null"), "no stdout redirect: {pre}");
+        // …only stderr is dropped, and it still fails open to exit 0.
+        assert!(pre.contains("2>/dev/null"), "PreToolUse drops stderr");
+        assert!(pre.ends_with("|| true"));
+    }
+
+    #[test]
+    fn the_status_hooks_stay_fire_and_forget() {
+        let s = settings(URL, TOKEN);
+        for event in ["PostToolUse", "Notification", "Stop"] {
+            let command = command_for(&s, event);
+            assert!(
+                command.contains(">/dev/null 2>&1"),
+                "{event} output is suppressed"
+            );
+        }
     }
 
     #[test]

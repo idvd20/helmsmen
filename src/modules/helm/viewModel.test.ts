@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+  HelmApproval,
   HelmCutState,
   HelmProfile,
   HelmProject,
@@ -9,6 +10,7 @@ import { HELM_STATUS_ALIAS } from "./api";
 import {
   buildWall,
   DEFAULT_PROFILE_COLOR,
+  deriveApprovalAsks,
   deriveCardBody,
   deriveHeaderCounts,
   elapsedMinutes,
@@ -240,6 +242,70 @@ describe("deriveCardBody", () => {
     });
     expect(body).toEqual({ kind: "activity", lines: ["running tests"] });
   });
+
+  it("a blocked body with a pending ask renders the approval ask block", () => {
+    const asks = [
+      { id: "card-1", tool: "Bash", rule: "git history rewrite", command: "git push --force" },
+    ];
+    const body = deriveCardBody("blocked", { cut: complete, approvalAsks: asks });
+    expect(body).toEqual({ kind: "approval", asks });
+  });
+});
+
+// The ask block (task #17): risk-list asks paused on the card — tool, rule,
+// exact command — correlated by id, and blocking regardless of session status.
+describe("deriveApprovalAsks", () => {
+  const ask = (over: Partial<HelmApproval> = {}): HelmApproval => ({
+    id: "card-1",
+    seq: 1,
+    sessionId: "s1",
+    toolName: "Bash",
+    toolUseId: "toolu_a",
+    status: "pending",
+    decision: "ask",
+    rule: { id: "git-history-rewrite", label: "git history rewrite" },
+    input: { command: "git push --force origin main" },
+    ...over,
+  });
+
+  it("is empty for an absent or empty list", () => {
+    expect(deriveApprovalAsks(undefined)).toEqual([]);
+    expect(deriveApprovalAsks([])).toEqual([]);
+  });
+
+  it("distills an open ask to tool, rule label, and exact command", () => {
+    expect(deriveApprovalAsks([ask()])).toEqual([
+      {
+        id: "card-1",
+        tool: "Bash",
+        rule: "git history rewrite",
+        command: "git push --force origin main",
+      },
+    ]);
+  });
+
+  it("shows only ask decisions that are still open (never allow/deny, never resolved)", () => {
+    const list: HelmApproval[] = [
+      ask({ id: "allow", decision: "allow", rule: undefined }),
+      ask({ id: "deny", decision: "deny" }),
+      ask({ id: "ran", status: "allowed" }),
+      ask({ id: "closed", status: "closedNoRun" }),
+      ask({ id: "open-pending", status: "pending" }),
+      ask({ id: "open-surfaced", status: "surfaced" }),
+    ];
+    expect(deriveApprovalAsks(list).map((a) => a.id)).toEqual([
+      "open-pending",
+      "open-surfaced",
+    ]);
+  });
+
+  it("falls back to file path when there is no command", () => {
+    const a = ask({
+      toolName: "Read",
+      input: { filePath: "config/.env.production" },
+    });
+    expect(deriveApprovalAsks([a])[0].command).toBe("config/.env.production");
+  });
 });
 
 describe("deriveHeaderCounts", () => {
@@ -398,5 +464,56 @@ describe("buildWall", () => {
       (c) => c.status === "working",
     ) as WorkspaceCardView;
     expect(working.pulse).toBe(false);
+  });
+
+  it("a pending ask blocks the Workspace and renders the ask block, outranking everything", () => {
+    // A Workspace whose cut completed and session is still working — a pending
+    // risk-list ask must override that to Blocked and surface the ask block.
+    const asked = buildWall({
+      projects: [projectA],
+      profiles: [profileA],
+      workspaces: [ws("wa", "prj-a", complete)],
+      facts: {
+        wa: {
+          sessions: [
+            {
+              sessionId: "s",
+              kind: "agent",
+              runtime: "tmux",
+              harness: "claude",
+              status: "working",
+            } satisfies SessionFacts,
+          ],
+          approvals: [
+            {
+              id: "card-7",
+              seq: 7,
+              sessionId: "s",
+              toolName: "Bash",
+              toolUseId: "toolu_x",
+              status: "surfaced",
+              decision: "ask",
+              rule: { id: "publish-deploy-db", label: "publish / deploy / database" },
+              input: { command: "npm publish" },
+            },
+          ],
+        },
+      },
+      nowMs: now,
+    });
+    const card = asked.cards[0];
+    expect(card.status).toBe("blocked");
+    expect(card.body).toEqual({
+      kind: "approval",
+      asks: [
+        {
+          id: "card-7",
+          tool: "Bash",
+          rule: "publish / deploy / database",
+          command: "npm publish",
+        },
+      ],
+    });
+    expect(asked.counts.needsYou).toBe(1);
   });
 });

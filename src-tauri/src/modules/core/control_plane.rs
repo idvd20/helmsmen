@@ -49,6 +49,7 @@
 use serde::Serialize;
 
 use super::cut::SessionSignal;
+use super::policy::{decide, Decision, PolicyContext, ToolInput};
 
 /// Session id used when a hook payload omits one. Correlation still works —
 /// unkeyed events simply group together — but a real per-Workspace endpoint
@@ -80,10 +81,13 @@ pub enum NotificationKind {
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum HookEventKind {
     /// A tool call is about to run. Activity (-> Working) that also enqueues
-    /// a pending approval keyed by `tool_use_id`.
+    /// a pending approval keyed by `tool_use_id`, carrying the parsed tool
+    /// input so the pure [`policy`](super::policy) can decide it and the ask
+    /// block can show the exact command.
     PreToolUse {
         tool_use_id: Option<String>,
         tool_name: String,
+        input: ToolInput,
     },
     /// A status-only notification (see [`NotificationKind`]).
     Notification { notification: NotificationKind },
@@ -145,7 +149,35 @@ impl CardStatus {
     }
 }
 
-/// One Approval Inbox card: a single tool call that needed a decision.
+/// What the user-level [`policy`](super::policy) decided for a card's tool
+/// call. Orthogonal to [`CardStatus`] (which tracks the correlation
+/// lifecycle): `decision` is *why* the call did or did not pause, `status` is
+/// *where it got to*. The frontend inbox renders only `Ask` cards as ask
+/// blocks; `Allow`/`Deny` cards are the audit trail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CardDecision {
+    /// Permitted — ran freely (permissive in-worktree).
+    Allow,
+    /// A risk-list rule fired — the call paused for an approval.
+    Ask,
+    /// A hard-deny rule fired — the call was blocked and never ran.
+    Deny,
+}
+
+/// The rule that fired, as the ask block / record shows it: a stable [`id`]
+/// (kebab-case, for logs) plus a human [`label`].
+///
+/// [`id`]: super::policy::RiskRule::id
+/// [`label`]: super::policy::RiskRule::label
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardRule {
+    pub id: String,
+    pub label: String,
+}
+
+/// One Approval Inbox card: a single tool call that the policy decided on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalCard {
@@ -159,6 +191,33 @@ pub struct ApprovalCard {
     /// resolved by the strict rule and closes at `Stop`.
     pub tool_use_id: Option<String>,
     pub status: CardStatus,
+    /// What the policy decided (why it did or did not pause).
+    pub decision: CardDecision,
+    /// The rule that fired, if any (present on `Ask`/`Deny`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<CardRule>,
+    /// The exact tool input the decision was made on — the ask block's
+    /// "exact command". This is the PRE-hook input; a user-level hook (RTK)
+    /// may rewrite the command afterwards, so a card may show pre-rewrite
+    /// text — an accepted fidelity caveat that never affects correlation.
+    pub input: ToolInput,
+}
+
+/// One approval record: every policy decision writes one, so the whole
+/// decision history is auditable. Workspace scope is implicit — a
+/// [`ControlPlaneState`] belongs to exactly one Workspace's endpoint. Bulk
+/// decisions (task #19) will be logged distinctly on top of this per-call
+/// trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRecord {
+    pub seq: u64,
+    pub session_id: String,
+    pub tool_name: String,
+    pub input: ToolInput,
+    pub decision: CardDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<CardRule>,
 }
 
 /// The whole control-plane reduction: derived approval cards plus a warnings
@@ -170,6 +229,30 @@ pub struct ControlPlaneState {
     pub cards: Vec<ApprovalCard>,
     pub warnings: Vec<String>,
     pub event_count: u64,
+    /// Append-only audit trail: one [`ApprovalRecord`] per policy decision.
+    pub records: Vec<ApprovalRecord>,
+}
+
+/// Map a pure [`Decision`] to the card/record shape (decision tag + the rule
+/// that fired).
+fn classify(decision: Decision) -> (CardDecision, Option<CardRule>) {
+    match decision {
+        Decision::Allow => (CardDecision::Allow, None),
+        Decision::Ask(rule) => (
+            CardDecision::Ask,
+            Some(CardRule {
+                id: rule.id().to_string(),
+                label: rule.label().to_string(),
+            }),
+        ),
+        Decision::Deny(rule) => (
+            CardDecision::Deny,
+            Some(CardRule {
+                id: rule.id().to_string(),
+                label: rule.label().to_string(),
+            }),
+        ),
+    }
 }
 
 /// The initial (empty) control-plane state.
@@ -188,10 +271,17 @@ fn short(sid: &str) -> &str {
 }
 
 /// The only way control-plane state changes: fold one [`HookEvent`] into the
-/// state. Pure and total. Replay-tolerant: a duplicated event (same
-/// `tool_use_id` re-sourced, a repeated result, a second `Stop`) never
-/// corrupts state — it is deduplicated or is a no-op.
-pub fn apply_hook_event(prev: ControlPlaneState, event: HookEvent) -> ControlPlaneState {
+/// state, evaluating the user-level [`policy`](super::policy) for each new
+/// `PreToolUse` against the trusted [`PolicyContext`]. Pure and total.
+/// Replay-tolerant: a duplicated event (same `tool_use_id` re-sourced, a
+/// repeated result, a second `Stop`) never corrupts state — it is
+/// deduplicated or is a no-op, and a deduplicated `PreToolUse` writes no
+/// second record.
+pub fn apply_hook_event(
+    prev: ControlPlaneState,
+    event: HookEvent,
+    policy: &PolicyContext,
+) -> ControlPlaneState {
     let mut state = prev;
     state.event_count += 1;
 
@@ -205,9 +295,11 @@ pub fn apply_hook_event(prev: ControlPlaneState, event: HookEvent) -> ControlPla
         HookEventKind::PreToolUse {
             tool_use_id,
             tool_name,
+            input,
         } => {
             // Idempotent enqueue: a replayed PreToolUse for a tool_use_id we
-            // already carry (in any state) must not source a second card.
+            // already carry (in any state) must not source a second card or a
+            // second record.
             if let Some(tuid) = tool_use_id.as_deref() {
                 let already = state
                     .cards
@@ -225,6 +317,16 @@ pub fn apply_hook_event(prev: ControlPlaneState, event: HookEvent) -> ControlPla
                     short(&sid)
                 ));
             }
+            // Every decision writes an approval record.
+            let (decision, rule) = classify(decide(&tool_name, &input, policy));
+            state.records.push(ApprovalRecord {
+                seq: event.seq,
+                session_id: sid.clone(),
+                tool_name: tool_name.clone(),
+                input: input.clone(),
+                decision,
+                rule: rule.clone(),
+            });
             state.cards.push(ApprovalCard {
                 id: format!("card-{}", event.seq),
                 seq: event.seq,
@@ -232,6 +334,9 @@ pub fn apply_hook_event(prev: ControlPlaneState, event: HookEvent) -> ControlPla
                 tool_name,
                 tool_use_id,
                 status: CardStatus::Pending,
+                decision,
+                rule,
+                input,
             });
         }
 
@@ -335,13 +440,29 @@ mod tests {
 
     const SESSION: &str = "bb6de6a5-789a-4bcf-97cf-2eca27d74234";
 
+    /// A trusted context whose worktree root and home make the destructive-fs
+    /// rule decidable in tests.
+    fn ctx() -> PolicyContext {
+        PolicyContext::new("/Users/dev/wt/feature", "/Users/dev")
+    }
+
+    /// A `PreToolUse` for an ordinary (policy-allowed) `ls` — the default the
+    /// lifecycle tests use, so status/correlation are exercised without a
+    /// risk rule firing.
     fn pre(seq: u64, tuid: &str, tool: &str) -> HookEvent {
+        pre_cmd(seq, tuid, tool, "ls")
+    }
+
+    /// A `PreToolUse` for a specific shell command, so a test can drive a
+    /// risk-list or hard-deny decision.
+    fn pre_cmd(seq: u64, tuid: &str, tool: &str, command: &str) -> HookEvent {
         HookEvent::new(
             seq,
             SESSION,
             HookEventKind::PreToolUse {
                 tool_use_id: Some(tuid.to_string()),
                 tool_name: tool.to_string(),
+                input: ToolInput::command(command),
             },
         )
     }
@@ -370,10 +491,13 @@ mod tests {
     }
 
     fn replay(events: &[HookEvent]) -> ControlPlaneState {
+        let ctx = ctx();
         events
             .iter()
             .cloned()
-            .fold(empty_state(), apply_hook_event)
+            .fold(empty_state(), |state, event| {
+                apply_hook_event(state, event, &ctx)
+            })
     }
 
     fn card<'a>(state: &'a ControlPlaneState, tuid: &str) -> &'a ApprovalCard {
@@ -483,6 +607,7 @@ mod tests {
             HookEventKind::PreToolUse {
                 tool_use_id: None,
                 tool_name: "Bash".to_string(),
+                input: ToolInput::command("ls"),
             },
         )]);
         assert_eq!(s.cards.len(), 1);
@@ -532,7 +657,8 @@ mod tests {
         assert_eq!(
             hook_event_signal(&HookEventKind::PreToolUse {
                 tool_use_id: Some("t".into()),
-                tool_name: "Bash".into()
+                tool_name: "Bash".into(),
+                input: ToolInput::command("ls"),
             }),
             Some(SessionSignal::Working)
         );
@@ -575,6 +701,7 @@ mod tests {
         let working = hook_event_signal(&HookEventKind::PreToolUse {
             tool_use_id: Some("t".into()),
             tool_name: "Bash".into(),
+            input: ToolInput::command("ls"),
         })
         .and_then(session_status_from_signal)
         .unwrap();
@@ -666,27 +793,133 @@ mod tests {
         let once = replay(&spike_corpus());
         // Feed the identical stream again (fresh seqs would differ in a live
         // system, but dedup is by tool_use_id, so the cards are unchanged).
+        let ctx = ctx();
         let twice = spike_corpus()
             .into_iter()
-            .fold(once.clone(), apply_hook_event);
+            .fold(once.clone(), |state, event| {
+                apply_hook_event(state, event, &ctx)
+            });
         assert_eq!(twice.cards, once.cards, "duplicate events must not corrupt");
+        assert_eq!(
+            twice.records, once.records,
+            "replayed PreToolUse writes no second record"
+        );
         assert!(twice.warnings.is_empty());
         assert_eq!(twice.event_count, 28);
+    }
+
+    // --- M3.5 policy: decisions on cards + records, correlation of asks ---
+
+    #[test]
+    fn a_risk_list_call_becomes_an_ask_card_with_the_rule_and_exact_command() {
+        let s = replay(&[pre_cmd(1, "toolu_a", "Bash", "git push --force origin main")]);
+        let c = card(&s, "toolu_a");
+        assert_eq!(c.decision, CardDecision::Ask);
+        assert_eq!(c.tool_name, "Bash");
+        assert_eq!(
+            c.rule.as_ref().map(|r| r.id.as_str()),
+            Some("git-history-rewrite")
+        );
+        // The ask block shows the exact (pre-rewrite) command.
+        assert_eq!(c.input.command.as_deref(), Some("git push --force origin main"));
+        assert!(s.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_hard_deny_call_is_recorded_as_deny_and_never_ran() {
+        // Hard-deny returns deny at the hook; the tool never runs, so no
+        // PostToolUse arrives and Stop closes the card unrun.
+        let s = replay(&[
+            pre_cmd(1, "toolu_a", "Bash", "sudo rm -rf /var"),
+            note(2, NotificationKind::Permission),
+            stop(3),
+        ]);
+        let c = card(&s, "toolu_a");
+        assert_eq!(c.decision, CardDecision::Deny);
+        assert_eq!(c.rule.as_ref().map(|r| r.id.as_str()), Some("hard-deny-sudo"));
+        assert_eq!(c.status, CardStatus::ClosedNoRun, "a hard-denied call never runs");
+    }
+
+    #[test]
+    fn every_decision_writes_exactly_one_record() {
+        let s = replay(&[
+            pre_cmd(1, "toolu_a", "Bash", "ls"),                 // allow
+            pre_cmd(2, "toolu_b", "Bash", "git reset --hard"),  // ask
+            pre_cmd(3, "toolu_c", "Bash", "sudo id"),           // deny
+        ]);
+        assert_eq!(s.records.len(), 3, "one record per PreToolUse decision");
+        let decisions: Vec<CardDecision> = s.records.iter().map(|r| r.decision).collect();
+        assert_eq!(
+            decisions,
+            vec![CardDecision::Allow, CardDecision::Ask, CardDecision::Deny]
+        );
+        // The record carries the exact input + rule fired.
+        assert_eq!(s.records[1].input.command.as_deref(), Some("git reset --hard"));
+        assert_eq!(
+            s.records[2].rule.as_ref().map(|r| r.id.as_str()),
+            Some("hard-deny-sudo")
+        );
+    }
+
+    #[test]
+    fn parallel_ask_cards_correlate_by_tool_use_id_not_command_string() {
+        // Two parallel risk calls, then their results arrive OUT OF ORDER and
+        // with RTK-REWRITTEN commands (post-hook the command string differs);
+        // correlation is strictly by tool_use_id, so both cards resolve to
+        // Allowed and nothing is misrouted. This is the spike's criterion-4
+        // (parallel + rewrite) applied to ask cards.
+        let s = replay(&[
+            pre_cmd(1, "toolu_p1", "Bash", "git push --force origin main"),
+            pre_cmd(2, "toolu_p2", "Bash", "git rebase -i HEAD~2"),
+            note(3, NotificationKind::Permission),
+            // Results out of order; the command a PostToolUse carries is
+            // irrelevant to correlation (and, per PostToolUse, unused).
+            post(4, "toolu_p2", "Bash"),
+            post(5, "toolu_p1", "Bash"),
+        ]);
+        assert_eq!(card(&s, "toolu_p1").decision, CardDecision::Ask);
+        assert_eq!(card(&s, "toolu_p2").decision, CardDecision::Ask);
+        assert_eq!(card(&s, "toolu_p1").status, CardStatus::Allowed);
+        assert_eq!(card(&s, "toolu_p2").status, CardStatus::Allowed);
+        assert!(
+            s.warnings.is_empty(),
+            "strict tool_use_id correlation leaves no ambiguity: {:?}",
+            s.warnings
+        );
+    }
+
+    #[test]
+    fn allow_cards_carry_an_allow_decision_and_no_rule() {
+        let s = replay(&[pre(1, "toolu_a", "Bash")]);
+        let c = card(&s, "toolu_a");
+        assert_eq!(c.decision, CardDecision::Allow);
+        assert!(c.rule.is_none());
     }
 
     // --- serialization shape (locks the M3.5 frontend contract) ---
 
     #[test]
     fn cards_serialize_camel_case_for_the_frontend_mirror() {
-        let s = replay(&[pre(1, "toolu_a", "Bash")]);
+        let s = replay(&[pre_cmd(1, "toolu_a", "Bash", "git push --force")]);
         let json = serde_json::to_value(&s).unwrap();
         let c = &json["cards"][0];
-        for key in ["id", "seq", "sessionId", "toolName", "toolUseId", "status"] {
+        for key in [
+            "id", "seq", "sessionId", "toolName", "toolUseId", "status", "decision", "input",
+        ] {
             assert!(c.get(key).is_some(), "missing camelCase key {key}");
         }
         assert_eq!(c["status"], "pending");
+        assert_eq!(c["decision"], "ask");
+        // The ask block's exact-command + rule (tool, rule, command) all ride
+        // the serialized card the frontend mirrors.
+        assert_eq!(c["input"]["command"], "git push --force");
+        assert_eq!(c["rule"]["id"], "git-history-rewrite");
+        assert_eq!(c["rule"]["label"], "git history rewrite");
         assert!(json.get("warnings").is_some());
         assert!(json.get("eventCount").is_some());
+        // The audit trail serializes too.
+        assert_eq!(json["records"][0]["decision"], "ask");
+        assert_eq!(json["records"][0]["input"]["command"], "git push --force");
     }
 
     #[test]
