@@ -152,10 +152,10 @@ pub(crate) fn case_unknown_session_ids_error(rt: &dyn Runtime) {
     assert!(rt.kill("ghost").is_err());
 }
 
-/// Snapshot returns the current screen (retained scrollback) verbatim without
-/// re-pointing the live sink — the M3.5 `capture-pane` analog the answering
-/// seam reads to verify a dialog before injecting. The live sink keeps
-/// receiving output after a snapshot is taken.
+/// Snapshot returns the current visible screen (the `capture-pane` analog the
+/// answering seam reads to verify a dialog before injecting) without
+/// re-pointing the live sink. The live sink keeps receiving output after a
+/// snapshot is taken.
 pub(crate) fn case_snapshot_captures_screen_without_disturbing_the_sink(rt: &dyn Runtime) {
     let (sink, out, _exit) = sink();
     let id = rt
@@ -265,6 +265,57 @@ pub(crate) fn case_invalid_specs_are_rejected(rt: &dyn Runtime) {
 
 mod local_pty {
     use super::super::local_pty::LocalPty;
+    use super::super::Runtime;
+    use super::{contains, sink, spec, wait_for};
+
+    /// A dismissed dialog must NOT survive in a snapshot: `snapshot` is the
+    /// `capture-pane` analog (the CURRENT visible screen), so a permission
+    /// dialog that was drawn and then cleared (`ESC[2J`) is gone. This is the
+    /// verify-before-inject safety property (user story 30): matching a
+    /// dialog against stale scrollback history could inject a key when no
+    /// dialog is live. LocalPty must reconstruct the visible screen, not
+    /// return raw scrollback bytes.
+    #[test]
+    fn snapshot_reflects_the_live_screen_not_dismissed_dialog_history() {
+        let rt = LocalPty::default();
+        let (sink, out, _exit) = sink();
+        let id = rt
+            .spawn(
+                spec(
+                    "/bin/sh",
+                    &[
+                        "-c",
+                        // Draw a permission dialog, then clear the screen and
+                        // repaint a clean line — exactly what a TUI does when a
+                        // dialog is dismissed. `sleep` keeps the session alive
+                        // so the snapshot is taken while the dialog is gone.
+                        "printf 'Bash command\\r\\n  rm -rf /important-data\\r\\n 1. Yes\\r\\n 2. No\\r\\nEsc to cancel\\r\\n'; \
+                         printf '\\033[2J\\033[H'; \
+                         printf 'DIALOG_DISMISSED_marker\\r\\n'; \
+                         sleep 5",
+                    ],
+                ),
+                sink,
+            )
+            .unwrap();
+        // Deterministic: wait until the post-clear repaint has been emitted.
+        wait_for(&out, |seen| contains(seen, b"DIALOG_DISMISSED_marker"));
+
+        let snap = rt.snapshot(&id).unwrap();
+        assert!(
+            contains(&snap, b"DIALOG_DISMISSED_marker"),
+            "snapshot must show the current visible screen"
+        );
+        assert!(
+            !contains(&snap, b"Esc to cancel"),
+            "a dismissed dialog's markers must NOT linger in the snapshot"
+        );
+        assert!(
+            !contains(&snap, b"rm -rf /important-data"),
+            "a dismissed dialog's command must NOT linger in the snapshot"
+        );
+        let _ = rt.kill(&id);
+    }
 
     macro_rules! conformance {
         ($($name:ident),* $(,)?) => {

@@ -111,14 +111,18 @@ pub enum Mismatch {
     DialogNotVisible,
 }
 
-/// Strip the escape/control sequences a raw PTY snapshot carries so the visible
-/// text can be matched like tmux `capture-pane -p` output. Removes CSI
+/// Strip the escape/control sequences a snapshot carries and return the visible
+/// text as LINES, so the command can be anchored to the dialog's own command
+/// row(s) rather than matched anywhere in the blob. Removes CSI
 /// (`ESC [ … final`), OSC (`ESC ] … BEL/ST`), and other two-byte `ESC x`
-/// sequences, drops remaining control bytes, and collapses runs of whitespace
-/// to single spaces. This is NOT the Runtime interpreting output to act on it
-/// (forbidden) — it is the answering seam reading the screen to verify a
-/// dialog, exactly what a real `capture-pane` hands back rendered.
-fn visible_text(snapshot: &[u8]) -> String {
+/// sequences, preserves line breaks (`\n`), maps remaining control bytes to
+/// spaces, and collapses intra-line whitespace runs to single spaces (blank
+/// lines are kept as empty strings). This is NOT the Runtime interpreting
+/// output to act on it (forbidden) — it is the answering seam reading the
+/// screen to verify a dialog. In production the snapshot is already the
+/// rendered visible screen (the Runtime's `capture-pane`); stripping here is
+/// defense in depth and keeps the planner testable with raw fixtures.
+fn visible_lines(snapshot: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(snapshot);
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -155,14 +159,16 @@ fn visible_text(snapshot: &[u8]) -> String {
             }
             continue;
         }
-        // Keep printable/whitespace; drop other control bytes.
-        if c.is_control() {
+        if c == '\n' {
+            out.push('\n');
+        } else if c.is_control() {
+            // \r and friends become a space and collapse away within a line.
             out.push(' ');
         } else {
             out.push(c);
         }
     }
-    collapse_ws(&out)
+    out.lines().map(collapse_ws).collect()
 }
 
 /// Collapse every run of ASCII whitespace to a single space and trim.
@@ -170,30 +176,85 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A line is dialog chrome — the prompt/options/footer that sit BELOW the
+/// command in a Claude Code permission dialog. Used to anchor the command
+/// match: the intended command must be the row(s) directly above this chrome,
+/// not a stray line elsewhere. Matched case-insensitively (layout copy).
+fn is_chrome_line(line_lower: &str) -> bool {
+    DIALOG_MARKERS.iter().any(|m| line_lower.contains(m)) || line_lower.contains("requires confirmation")
+}
+
+/// The first non-blank line at or below `idx` is dialog chrome. A command with
+/// nothing (or non-chrome) below it is not an active dialog — fail safe.
+fn next_is_chrome(lines: &[String], mut idx: usize) -> bool {
+    while idx < lines.len() && lines[idx].is_empty() {
+        idx += 1;
+    }
+    lines.get(idx).is_some_and(|line| is_chrome_line(&line.to_lowercase()))
+}
+
+/// Is `want` the command of the dialog currently on screen? True iff some run
+/// of consecutive non-blank visible lines collapses to EXACTLY `want`
+/// (case-sensitive) AND is immediately followed by dialog chrome. Exact
+/// equality defeats the substring/prefix hazard — a card command that is only
+/// a prefix of a longer, more dangerous live command ("git push" vs the
+/// on-screen "git push --force origin main") never matches. The multi-line run
+/// tolerates a soft-wrapped command; the chrome anchor ties the match to the
+/// active dialog. Any layout the extractor doesn't recognize yields no match →
+/// [`Mismatch::DialogNotVisible`] (fail safe, never a mis-injection).
+fn command_is_on_screen(lines: &[String], want: &str) -> bool {
+    for start in 0..lines.len() {
+        if lines[start].is_empty() {
+            continue;
+        }
+        let mut run: Vec<&str> = Vec::new();
+        for line in &lines[start..] {
+            if line.is_empty() {
+                break; // a command is contiguous — don't span a blank row
+            }
+            run.push(line);
+            if collapse_ws(&run.join(" ")) == want && next_is_chrome(lines, start + run.len()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The pure plan for answering a Claude Code permission dialog: verify the
 /// intended card is the one on screen, then return its key sequence. On any
 /// mismatch return the reason and NO steps — the shell injects nothing.
 ///
-/// Command matching is case-SENSITIVE (tightest form of the security check —
-/// never resume a differently-cased command); dialog-presence markers are
-/// matched case-insensitively (layout copy, not identity).
+/// Command matching is case-SENSITIVE and EXACT (tightest form of the security
+/// check — never resume a differently-cased command, and never resume a
+/// command that only *contains* the card's command as a substring/prefix); it
+/// is anchored to the dialog's own command row(s), not matched anywhere in the
+/// screen. Dialog-presence markers are matched case-insensitively (layout copy,
+/// not identity). The snapshot passed here is the CURRENT visible screen (the
+/// Runtime's `capture-pane`), so a dismissed or a queued-underneath dialog is
+/// not on it — the seam verifies against what is truly live (user story 30).
 pub fn claude_code_answer_plan(
     snapshot: &[u8],
     dialog: &IntendedDialog,
     answer: &PromptAnswer,
 ) -> Result<Vec<KeyStep>, Mismatch> {
-    let screen = visible_text(snapshot);
+    let lines = visible_lines(snapshot);
 
     // 1. Is a permission dialog even up? If not, do not inject a stray key.
-    let lower = screen.to_lowercase();
-    if !DIALOG_MARKERS.iter().any(|m| lower.contains(m)) {
+    let has_dialog = lines.iter().any(|line| {
+        let lower = line.to_lowercase();
+        DIALOG_MARKERS.iter().any(|m| lower.contains(m))
+    });
+    if !has_dialog {
         return Err(Mismatch::NoDialog);
     }
 
-    // 2. Is THIS card's exact command the one visible? An empty expected
-    //    command can never be verified, so it fails safe.
+    // 2. Is THIS card's exact command the one on the live dialog? Matched
+    //    exactly against the command row(s) directly above the prompt, so a
+    //    substring/prefix of a different, longer command never verifies. An
+    //    empty expected command can never be verified, so it fails safe.
     let want = collapse_ws(dialog.expected_command);
-    if want.is_empty() || !screen.contains(&want) {
+    if want.is_empty() || !command_is_on_screen(&lines, &want) {
         return Err(Mismatch::DialogNotVisible);
     }
 
@@ -327,6 +388,31 @@ mod tests {
             .to_vec();
         let steps = allow(&screen, "npm publish --access public").unwrap();
         assert_eq!(steps, vec![KeyStep::Inject(b"1".to_vec())]);
+    }
+
+    #[test]
+    fn a_prefix_of_a_longer_visible_command_is_a_mismatch() {
+        // The user's card is "git push" (a benign call they approved), but the
+        // dialog actually up is for the more dangerous "git push --force origin
+        // main". The card's command is a PREFIX of the visible one — verifying
+        // by substring would Allow the force-push. It must be a mismatch.
+        let screen = dialog_screen("git push --force origin main");
+        let err = allow(&screen, "git push").unwrap_err();
+        assert_eq!(
+            err,
+            Mismatch::DialogNotVisible,
+            "a prefix must not resume a longer, different command"
+        );
+    }
+
+    #[test]
+    fn a_substring_of_a_longer_visible_command_is_a_mismatch() {
+        // Card "rm -rf build"; the live dialog is "rm -rf build/../../etc". The
+        // card command is a substring of the visible one — must not Allow the
+        // path-escaping variant.
+        let screen = dialog_screen("rm -rf build/../../etc");
+        let err = allow(&screen, "rm -rf build").unwrap_err();
+        assert_eq!(err, Mismatch::DialogNotVisible, "a substring is not the same command");
     }
 
     #[test]

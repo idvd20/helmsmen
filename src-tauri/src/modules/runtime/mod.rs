@@ -71,13 +71,17 @@ pub trait Runtime: Send + Sync {
     /// Type into the session. Bytes go to the process verbatim.
     fn write(&self, session: &str, bytes: &[u8]) -> Result<(), String>;
 
-    /// A read-only snapshot of the session's current screen — the M3.5
-    /// `capture-pane` analog, generic over every Runtime. Returns the retained
-    /// scrollback bytes verbatim (hostile data; never interpreted here). Unlike
-    /// [`attach`](Self::attach) it does NOT re-point the live sink, so the
-    /// answering seam can verify the visible dialog before injecting any key
-    /// without disturbing the UI's stream. Tmux at M4 implements this as
-    /// `tmux capture-pane`; the conformance suite pins the behavior.
+    /// A read-only snapshot of the session's CURRENT VISIBLE SCREEN — the M3.5
+    /// `capture-pane` analog, generic over every Runtime. This is the rendered
+    /// screen (a dialog drawn then cleared is gone; a queued dialog on top
+    /// hides the one beneath), NOT session history, so the answering seam
+    /// verifies the live dialog before injecting a key (verify-before-inject,
+    /// user story 30). LocalPty reconstructs it from retained scrollback via a
+    /// terminal-grid model; Tmux at M4 returns `tmux capture-pane` directly.
+    /// Unlike [`attach`](Self::attach) it does NOT re-point the live sink, so
+    /// it never disturbs the UI's stream. The conformance suite pins the
+    /// behavior. (The bytes are still hostile — the caller strips them; the
+    /// runtime does not interpret output for display, only renders the grid.)
     fn snapshot(&self, session: &str) -> Result<Vec<u8>, String>;
 
     fn resize(&self, session: &str, cols: u16, rows: u16) -> Result<(), String>;

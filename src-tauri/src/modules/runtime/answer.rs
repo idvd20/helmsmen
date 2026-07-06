@@ -257,6 +257,142 @@ mod tests {
     }
 }
 
+// --- End-to-end seam over a REAL PTY (no claude): the verify-before-inject
+//     safety property against genuinely-rendered output. Drives a plain `sh`
+//     that paints permission-dialog-shaped frames and clears them, so the
+//     snapshot → capture-pane → match → inject path is exercised end to end,
+//     deterministically, with no interactive agent. Proves the story-30 fix
+//     (HIGH finding): a dialog that is dismissed, or a different dialog
+//     rendered on top, is NOT answered. Unix-only (real PTY).
+#[cfg(all(test, unix))]
+mod real_pty_seam {
+    use std::time::{Duration, Instant};
+
+    use super::{answer_prompt, AnswerOutcome};
+    use crate::modules::harness::claude_code::ClaudeCode;
+    use crate::modules::harness::{IntendedDialog, Mismatch, PromptAnswer};
+    use crate::modules::runtime::local_pty::LocalPty;
+    use crate::modules::runtime::{OutputSink, Runtime, SpawnSpec};
+
+    fn sink() -> OutputSink {
+        OutputSink {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(|_| {}),
+        }
+    }
+
+    /// Spawn `/bin/sh -c script` on a real PTY, then poll the rendered
+    /// snapshot until it satisfies `ready` (bounded), so the assertion runs
+    /// against a settled visible screen.
+    fn spawn_until(script: &str, ready: impl Fn(&str) -> bool) -> (LocalPty, String) {
+        let rt = LocalPty::default();
+        let spec = SpawnSpec {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            env: Default::default(),
+            cols: 120,
+            rows: 40,
+        };
+        let id = rt.spawn(spec, sink()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let screen = rt.snapshot(&id).unwrap_or_default();
+            if ready(&String::from_utf8_lossy(&screen)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        (rt, id)
+    }
+
+    fn dialog_frame(command: &str) -> String {
+        format!(
+            "printf 'Bash command\\r\\n  {command}\\r\\nHook PreToolUse:Bash requires confirmation\\r\\n \
+             1. Yes\\r\\n 2. No, and tell Claude what to do differently\\r\\nEsc to cancel\\r\\n'; "
+        )
+    }
+
+    fn intend(command: &str) -> IntendedDialog<'_> {
+        IntendedDialog {
+            tool_use_id: Some("toolu_a"),
+            expected_command: command,
+        }
+    }
+
+    #[test]
+    fn a_dialog_rendered_on_top_hides_the_one_beneath_so_it_is_not_answered() {
+        // Dialog A is painted, the screen is cleared, then dialog B is painted
+        // on top (the newest-on-top hazard, user story 30). The live screen is
+        // B's; answering the A card must inject NOTHING, and answering the B
+        // card that is actually visible must inject.
+        let script = format!(
+            "{a}printf '\\033[2J\\033[H'; {b}sleep 5",
+            a = dialog_frame("git push --force origin main"),
+            b = dialog_frame("git rebase -i HEAD~5"),
+        );
+        let (rt, id) = spawn_until(&script, |s| s.contains("git rebase -i HEAD~5"));
+
+        // The A card is queued underneath — its command is not on the live
+        // screen (it would be, in raw scrollback: the bug this guards).
+        let miss = answer_prompt(
+            &rt,
+            &ClaudeCode,
+            &id,
+            &intend("git push --force origin main"),
+            &PromptAnswer::Allow,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            miss,
+            AnswerOutcome::Mismatch { reason: Mismatch::DialogNotVisible },
+            "the queued-underneath card must never be answered"
+        );
+
+        // The B dialog is the live one, so its card verifies and injects.
+        let hit = answer_prompt(
+            &rt,
+            &ClaudeCode,
+            &id,
+            &intend("git rebase -i HEAD~5"),
+            &PromptAnswer::Allow,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(hit, AnswerOutcome::Injected, "the visible dialog's card verifies");
+        let _ = rt.kill(&id);
+    }
+
+    #[test]
+    fn a_dismissed_dialog_leaves_no_live_dialog_to_answer() {
+        // A dialog is painted then the screen cleared and a plain line drawn —
+        // the dialog is gone. Answering its card must report NoDialog (against
+        // raw scrollback the stale markers would still match → stray key).
+        let script = format!(
+            "{a}printf '\\033[2J\\033[HALL_CLEAR_no_dialog\\r\\n'; sleep 5",
+            a = dialog_frame("git push --force origin main"),
+        );
+        let (rt, id) = spawn_until(&script, |s| s.contains("ALL_CLEAR_no_dialog"));
+
+        let miss = answer_prompt(
+            &rt,
+            &ClaudeCode,
+            &id,
+            &intend("git push --force origin main"),
+            &PromptAnswer::Deny { reason: String::new() },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            miss,
+            AnswerOutcome::Mismatch { reason: Mismatch::NoDialog },
+            "a dismissed dialog is not a live dialog"
+        );
+        let _ = rt.kill(&id);
+    }
+}
+
 // --- Test seam 2: live integration vs a real `claude` prompt ---
 //
 // The ONE fragile seam, exercised against a live agent: capture-pane match
