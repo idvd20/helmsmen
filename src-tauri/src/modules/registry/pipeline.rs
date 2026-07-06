@@ -176,31 +176,19 @@ pub fn run(
     let ws = &cut.workspace;
     let repo_root = Path::new(&cut.project.repo_root);
 
-    // Step 1: fetch (optional) — main-checkout git, before anything is
-    // created, so a failure parks with nothing to tear down.
-    if cut.fetch {
-        if let Err(log) = run_git(repo_root, &["fetch"]) {
-            return park(registry, cut, CutStep::Fetch, log);
-        }
-    }
-
-    // Step 2: `git worktree add` off base with the branch template
-    // applied (the branch and path were validated at enqueue).
-    if let Err(log) = run_git(
-        repo_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &ws.branch,
-            &ws.worktree_path,
-            &cut.project.base_branch,
-        ],
-    ) {
-        // A failed add can leave partial bookkeeping: sweep it, then
-        // park — nothing of this step survives.
-        remove_worktree_best_effort(&cut.project.repo_root, &ws.worktree_path, &ws.branch);
-        return park(registry, cut, CutStep::WorktreeAdd, log);
+    // Steps 1 + 2 are main-checkout git work, serialized under CUT_LOCK
+    // (issue #33): concurrent cuts in one Project must not contend on
+    // git's own repo locks (HEAD.lock, packed-refs — a valid cut parking
+    // on a spurious lock error), and a failure sweep must never
+    // interleave with another cut's `git worktree add`. Only this git
+    // segment holds the lock — a slow setup script must not block
+    // enqueue (the registry stays responsive mid-cut).
+    let git_steps = {
+        let _guard = CUT_LOCK.lock().expect("cut lock poisoned");
+        create_worktree(registry, cut, repo_root)
+    };
+    if let Err((step, log)) = git_steps {
+        return park(registry, cut, step, log);
     }
     // From here on the worktree is *recorded*: it is the Workspace's own
     // registry path, and removal stays retryable — a parked cut is never
@@ -324,7 +312,7 @@ pub fn run(
         Err(log) => return park(registry, cut, CutStep::LaunchSession, log),
     };
 
-    if !settle(
+    match settle(
         registry,
         cut,
         Event::CutCompleted {
@@ -332,12 +320,101 @@ pub fn run(
             first_session_id: first_session_id.clone(),
         },
     ) {
-        // The Workspace vanished mid-cut (scuttled): the session just
-        // launched belongs to nothing — kill it, and drop the control-plane
-        // endpoint so its listener thread does not outlive the Workspace.
-        let _ = runtime.kill(&first_session_id);
-        endpoints.remove(&ws.id);
+        Settled::Recorded => {}
+        Settled::WorkspaceGone => {
+            // The Workspace vanished mid-cut (scuttled): the session just
+            // launched belongs to nothing — kill it, and drop the
+            // control-plane endpoint so its listener thread does not
+            // outlive the Workspace.
+            let _ = runtime.kill(&first_session_id);
+            endpoints.remove(&ws.id);
+        }
+        Settled::CommitFailed => {
+            // The Workspace is live and its first session is running: a
+            // bookkeeping failure must not kill it — that would wedge the
+            // Workspace (stuck Cutting forever, dead agent, no endpoint).
+            // The error is surfaced by `settle`; everything real — the
+            // worktree, the session, the endpoint — stays intact.
+        }
     }
+}
+
+/// Steps 1 + 2: the main-checkout git work — `git fetch` (optional) and
+/// `git worktree add` off base with the branch template applied (the
+/// branch and path were validated at enqueue). The caller holds
+/// [`CUT_LOCK`] — see [`run`].
+fn create_worktree(
+    registry: &RegistryState,
+    cut: &EnqueuedCut,
+    repo_root: &Path,
+) -> Result<(), (CutStep, String)> {
+    // Step 1: fetch (optional) — before anything is created, so a
+    // failure parks with nothing to tear down.
+    if cut.fetch {
+        run_git(repo_root, &["fetch"]).map_err(|log| (CutStep::Fetch, log))?;
+    }
+
+    // Step 2: `git worktree add`.
+    if let Err(log) = run_git(
+        repo_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &cut.workspace.branch,
+            &cut.workspace.worktree_path,
+            &cut.project.base_branch,
+        ],
+    ) {
+        // A failed add can leave partial bookkeeping: sweep it, then
+        // park — nothing of this step survives. Ownership-checked: if
+        // this cut was scuttled while queued, its recycled Slot's path
+        // and branch may already belong to a different live Workspace.
+        remove_worktree_if_owned(registry, cut);
+        return Err((CutStep::WorktreeAdd, log));
+    }
+    Ok(())
+}
+
+/// Tear down this cut's worktree and branch — unless they no longer
+/// belong to it. Paths and branches derive from (slug, Slot) — never the
+/// unique Workspace id — and Slots recycle: a Workspace scuttled mid-cut
+/// frees its Slot, and the next cut of the same slug legitimately claims
+/// the same path and branch. The registry is the ownership record: if any
+/// OTHER live Workspace claims the path or branch, or ownership cannot be
+/// verified at all, nothing is removed — fail safe, because an orphan
+/// directory is recoverable and a destroyed live worktree is not. The
+/// caller must hold [`CUT_LOCK`], which makes the check atomic against
+/// enqueue committing a new claimant.
+fn remove_worktree_if_owned(registry: &RegistryState, cut: &EnqueuedCut) {
+    let ws = &cut.workspace;
+    let claimed_by_other = match registry.snapshot() {
+        Ok(state) => state.workspaces.iter().any(|w| {
+            w.id != ws.id
+                && (w.worktree_path == ws.worktree_path
+                    || (w.project_id == ws.project_id && w.branch == ws.branch))
+        }),
+        Err(e) => {
+            log::warn!(
+                "cut teardown of workspace {}: cannot verify worktree ownership ({e}); \
+                 leaving {:?} in place",
+                ws.id,
+                ws.worktree_path
+            );
+            return;
+        }
+    };
+    if claimed_by_other {
+        log::warn!(
+            "cut teardown of workspace {}: {:?} / branch {:?} now belong to another live \
+             workspace; leaving them in place",
+            ws.id,
+            ws.worktree_path,
+            ws.branch
+        );
+        return;
+    }
+    remove_worktree_best_effort(&cut.project.repo_root, &ws.worktree_path, &ws.branch);
 }
 
 /// Park an enqueued cut whose Runtime or Harness could not even be
@@ -368,13 +445,32 @@ fn park(registry: &RegistryState, cut: &EnqueuedCut, step: CutStep, log: String)
     );
 }
 
+/// What became of a cut-lifecycle commit ([`settle`]). The two failure
+/// shapes demand opposite reactions and must never be conflated (issue
+/// #33): a gone Workspace's effects are torn down, a live Workspace's
+/// effects are sacrosanct.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// The event is recorded on the Workspace.
+    Recorded,
+    /// The Workspace was removed mid-cut (scuttled): the event had
+    /// nothing to land on, and the pipeline's git effects were torn down
+    /// (where this cut still owned them).
+    WorkspaceGone,
+    /// The commit failed but the Workspace is still live (poisoned or
+    /// unwritable registry). Nothing was destroyed: the Workspace keeps
+    /// its worktree — and the caller must keep its session and endpoint.
+    CommitFailed,
+}
+
 /// Commit a cut-lifecycle event. If it cannot be committed because the
 /// Workspace is gone — the user scuttled it mid-cut — tear the pipeline's
 /// git effects down so nothing broken survives without a registry record.
-/// Returns whether the event was recorded.
-fn settle(registry: &RegistryState, cut: &EnqueuedCut, event: Event) -> bool {
+/// A commit that fails while the Workspace is still live tears nothing
+/// down: the error is surfaced and the Workspace stays whole.
+fn settle(registry: &RegistryState, cut: &EnqueuedCut, event: Event) -> Settled {
     let Err(commit_err) = registry.commit(event) else {
-        return true;
+        return Settled::Recorded;
     };
     let workspace_gone = matches!(
         registry.snapshot(),
@@ -385,18 +481,19 @@ fn settle(registry: &RegistryState, cut: &EnqueuedCut, event: Event) -> bool {
             "workspace {} was removed mid-cut; tearing the worktree down",
             cut.workspace.id
         );
-        remove_worktree_best_effort(
-            &cut.project.repo_root,
-            &cut.workspace.worktree_path,
-            &cut.workspace.branch,
-        );
+        // Serialized with enqueue/cut/remove so the ownership check and
+        // the removal are atomic against the Slot being recycled.
+        let _guard = CUT_LOCK.lock().expect("cut lock poisoned");
+        remove_worktree_if_owned(registry, cut);
+        Settled::WorkspaceGone
     } else {
-        log::warn!(
-            "cannot record cut lifecycle for workspace {}: {commit_err}",
+        log::error!(
+            "cannot record cut lifecycle for workspace {} (leaving the live workspace, \
+             its session and its endpoint untouched): {commit_err}",
             cut.workspace.id
         );
+        Settled::CommitFailed
     }
-    false
 }
 
 /// The ambient first Session has no viewer yet: bytes are retained by the
@@ -1593,6 +1690,159 @@ mod tests {
             Path::new(&f.repo_root),
             "helm/fix"
         ));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // task #33 — cut concurrency/teardown: ownership-checked teardown,
+    // commit-failure isolation, serialized main-checkout git work.
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn a_stale_teardown_never_removes_a_live_workspace_that_recycled_the_slot() {
+        let f = fixture();
+        // Cut A is enqueued, then scuttled while still queued: its Slot
+        // frees up before its pipeline ever ran.
+        let enq_a = enqueue(&f.registry, &request("fix", "a")).unwrap();
+        worktree::remove(&f.registry, &enq_a.workspace.id).unwrap();
+
+        // Cut B recycles the Slot: same slug → same path, same branch —
+        // (slug, Slot) is all the path and branch derive from.
+        let enq_b = enqueue(&f.registry, &request("fix", "b")).unwrap();
+        assert_eq!(enq_b.workspace.slot, enq_a.workspace.slot);
+        assert_eq!(enq_b.workspace.worktree_path, enq_a.workspace.worktree_path);
+        assert_eq!(enq_b.workspace.branch, enq_a.workspace.branch);
+        let runtime = RecordingRuntime::default();
+        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &f.endpoints, &enq_b);
+        assert!(matches!(cut_state(&f), CutState::Complete { .. }));
+
+        // A's stale pipeline finally runs: its `git worktree add` fails
+        // (B owns the branch) and its Workspace is gone from the registry
+        // — both teardown paths fire, and neither may touch what now
+        // belongs to live B.
+        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &f.endpoints, &enq_a);
+
+        assert!(
+            Path::new(&enq_b.workspace.worktree_path).is_dir(),
+            "the live workspace's worktree must survive a stale teardown"
+        );
+        assert!(
+            worktree::branch_exists(Path::new(&f.repo_root), &enq_b.workspace.branch),
+            "the live workspace's branch must survive a stale teardown"
+        );
+        // B is still the one recorded Workspace, untouched.
+        assert!(matches!(cut_state(&f), CutState::Complete { .. }));
+        assert_eq!(
+            f.registry.snapshot().unwrap().workspaces[0].id,
+            enq_b.workspace.id
+        );
+    }
+
+    #[test]
+    fn a_commit_failure_on_a_live_workspace_keeps_the_first_session_alive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = fixture();
+        let enq = enqueue(&f.registry, &request("fix", "b")).unwrap();
+
+        // Break persistence only (disk full / permissions): the in-memory
+        // Workspace stays live, but the CutCompleted commit will fail.
+        let appdata = f._tmp.path().join("appdata");
+        let set_mode = |mode: u32| {
+            let mut perms = std::fs::metadata(&appdata).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(&appdata, perms).unwrap();
+        };
+        set_mode(0o555);
+
+        let runtime = RecordingRuntime::default();
+        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &f.endpoints, &enq);
+        set_mode(0o755);
+
+        // The launched session must stay alive and wired: killing it over
+        // a bookkeeping failure would wedge the Workspace — stuck Cutting
+        // forever with a dead agent and no endpoint.
+        assert_eq!(runtime.spawned.lock().unwrap().len(), 1);
+        assert!(
+            runtime.killed.lock().unwrap().is_empty(),
+            "a live workspace's session must not be killed over a commit failure"
+        );
+        assert!(
+            f.endpoints.get(&enq.workspace.id).is_some(),
+            "the control-plane endpoint must survive a commit failure"
+        );
+        // The Workspace itself is untouched: still live, worktree intact.
+        assert_eq!(cut_state(&f), CutState::Cutting);
+        assert!(Path::new(&enq.workspace.worktree_path).is_dir());
+        assert!(worktree::branch_exists(
+            Path::new(&f.repo_root),
+            &enq.workspace.branch
+        ));
+    }
+
+    #[test]
+    fn the_pipelines_git_work_is_serialized_under_the_cut_lock() {
+        let f = fixture();
+        let enq = enqueue(&f.registry, &request("fix", "b")).unwrap();
+        let runtime = RecordingRuntime::default();
+
+        std::thread::scope(|scope| {
+            let registry = &f.registry;
+            let roots = &f.roots;
+            let endpoints = &f.endpoints;
+            let rt = &runtime;
+            let enq_ref = &enq;
+            // Hold the lock the way a concurrent cut/remove/enqueue would.
+            let guard = CUT_LOCK.lock().unwrap();
+            let handle = scope.spawn(move || {
+                run(registry, roots, rt, &ClaudeCode, endpoints, enq_ref);
+            });
+            // While the lock is held the pipeline must not touch the main
+            // checkout: no worktree may appear.
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(
+                !Path::new(&enq.workspace.worktree_path).exists(),
+                "run() must wait for the cut lock before its git work"
+            );
+            drop(guard);
+            handle.join().unwrap();
+        });
+        assert!(matches!(cut_state(&f), CutState::Complete { .. }));
+    }
+
+    #[test]
+    fn concurrent_cuts_in_one_project_all_complete_without_lock_flakes() {
+        // Three cuts race on the same main checkout. Their `git worktree
+        // add` calls contend on git's own repo locks (HEAD.lock,
+        // packed-refs) unless the pipeline serializes them — a valid cut
+        // must never park on a spurious lock error.
+        let f = fixture();
+        let cuts: Vec<EnqueuedCut> = ["one", "two", "three"]
+            .iter()
+            .map(|slug| enqueue(&f.registry, &request(slug, "b")).unwrap())
+            .collect();
+        let runtime = RecordingRuntime::default();
+        std::thread::scope(|scope| {
+            let registry = &f.registry;
+            let roots = &f.roots;
+            let endpoints = &f.endpoints;
+            let rt = &runtime;
+            for cut in &cuts {
+                scope.spawn(move || {
+                    run(registry, roots, rt, &ClaudeCode, endpoints, cut);
+                });
+            }
+        });
+
+        let state = f.registry.snapshot().unwrap();
+        assert_eq!(state.workspaces.len(), 3);
+        for w in &state.workspaces {
+            assert!(
+                matches!(w.cut, CutState::Complete { .. }),
+                "cut {:?} must complete, got {:?}",
+                w.slug,
+                w.cut
+            );
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
