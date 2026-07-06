@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -51,13 +51,40 @@ struct Session {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
 }
 
+impl Session {
+    /// Signal the child, but only while it is still running. `status` flips
+    /// to `Exited` only after `child.wait()` returned — i.e. after the OS
+    /// reaped the pid — so an exited status means the pid may already belong
+    /// to an unrelated process and must NOT be signalled (fail safe: skip),
+    /// while a running status means the pid is still ours (alive or an
+    /// unreaped zombie, which ignores signals harmlessly).
+    ///
+    /// Locks are read through poison on purpose: teardown must still reap a
+    /// child even if a panic poisoned a lock, and both protected values stay
+    /// coherent for this use (status is a plain flag; the killer is a pid
+    /// handle).
+    fn kill_if_running(&self) -> Result<(), String> {
+        let status = self.ctl.lock().unwrap_or_else(PoisonError::into_inner).status;
+        if matches!(status, SessionStatus::Exited(_)) {
+            return Ok(());
+        }
+        self.killer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .kill()
+            .map_err(|e| e.to_string())
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
-        // A session dropped without an explicit kill (map cleared, app
-        // teardown) must not leak its child.
-        if let Ok(mut k) = self.killer.lock() {
-            let _ = k.kill();
-        }
+        // Last resort: a session dropped without an explicit kill must not
+        // leak its child. NOTE this alone cannot reap a LIVE child at app
+        // teardown — the reader/waiter threads hold `Arc<Session>` clones
+        // until the child exits, so the refcount reaches zero only after
+        // exit. Live children are reaped by `LocalPty::shutdown` instead,
+        // which kills through the shared handle at any refcount.
+        let _ = self.kill_if_running();
     }
 }
 
@@ -75,6 +102,61 @@ impl LocalPty {
             .get(session)
             .cloned()
             .ok_or_else(|| format!("no session {session:?}"))
+    }
+
+    /// Explicit teardown: kill every live child and forget all sessions.
+    /// Also runs on `Drop`, so the "sessions die with the app" contract
+    /// holds for graceful shutdown. Killing goes through each session's
+    /// shared killer handle — it deliberately does NOT rely on `Session`'s
+    /// own `Drop`, whose refcount cannot reach zero while the child lives
+    /// (the reader/waiter threads hold clones). Idempotent, and proceeds
+    /// through poisoned locks: teardown must reap children even mid-panic.
+    pub fn shutdown(&self) {
+        let sessions: Vec<Arc<Session>> = {
+            let mut map = self
+                .sessions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            map.drain().map(|(_, session)| session).collect()
+        };
+        for session in sessions {
+            // Best effort per child: one failed signal must not stop the
+            // rest of the teardown.
+            if let Err(e) = session.kill_if_running() {
+                log::warn!("local-pty shutdown: failed to kill child: {e}");
+            }
+        }
+    }
+
+    /// Drop every exited session from the map, releasing its retained
+    /// scrollback (up to [`SCROLLBACK_MAX`]); returns how many were pruned.
+    /// Running sessions are untouched. A pruned id then fails every
+    /// operation exactly like an unknown id — callers decide when an exited
+    /// session's backlog is no longer needed (the post-exit `status`/`attach`
+    /// contract holds until they do).
+    pub fn prune_exited(&self) -> usize {
+        let mut map = self.sessions.write().expect("sessions lock poisoned");
+        let before = map.len();
+        map.retain(|_, session| {
+            // Read through poison: one session's poisoned lock must not
+            // panic the sweep (which would poison the map lock for everyone).
+            matches!(
+                session
+                    .ctl
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .status,
+                SessionStatus::Running
+            )
+        });
+        before - map.len()
+    }
+}
+
+impl Drop for LocalPty {
+    fn drop(&mut self) {
+        // App teardown (task #35): live children are reaped, never orphaned.
+        self.shutdown();
     }
 }
 
@@ -275,22 +357,196 @@ impl Runtime for LocalPty {
     }
 
     fn kill(&self, session: &str) -> Result<(), String> {
-        let session = self.get(session)?;
-        let already_exited = matches!(
-            session.ctl.lock().expect("ctl lock poisoned").status,
-            SessionStatus::Exited(_)
-        );
-        if already_exited {
-            return Ok(());
+        // Idempotent on an already-exited session (trait contract): the
+        // helper skips the signal once the status says exited.
+        self.get(session)?.kill_if_running()
+    }
+}
+
+/// Session-lifecycle tests (issue #35): teardown must reap live children and
+/// the map must be prunable. The behavioral conformance suite (streaming,
+/// snapshot, attach) lives in `super::conformance` and is untouched here.
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use std::process::Command;
+    use std::sync::mpsc::{channel, Receiver};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    fn sink() -> (OutputSink, Receiver<Vec<u8>>, Receiver<i32>) {
+        let (out_tx, out_rx) = channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = channel::<i32>();
+        let sink = OutputSink {
+            on_output: Box::new(move |bytes| {
+                let _ = out_tx.send(bytes.to_vec());
+            }),
+            on_exit: Box::new(move |code| {
+                let _ = exit_tx.send(code);
+            }),
+        };
+        (sink, out_rx, exit_rx)
+    }
+
+    fn spec(program: &str, args: &[&str]) -> SpawnSpec {
+        SpawnSpec {
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            env: Default::default(),
+            cols: 80,
+            rows: 24,
         }
-        // Bind to a local so the MutexGuard temporary drops before
-        // `session` (tail-expression temporary drop order).
-        let result = session
-            .killer
-            .lock()
-            .expect("killer lock poisoned")
-            .kill()
-            .map_err(|e| e.to_string());
-        result
+    }
+
+    /// Drain output until `pred` matches the accumulated transcript or the
+    /// deadline passes; panics with the transcript on timeout.
+    fn wait_for(rx: &Receiver<Vec<u8>>, pred: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+        let deadline = Instant::now() + DEADLINE;
+        let mut seen: Vec<u8> = Vec::new();
+        while !pred(&seen) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(chunk) => seen.extend_from_slice(&chunk),
+                Err(_) => panic!(
+                    "timeout waiting for output; transcript so far: {:?}",
+                    String::from_utf8_lossy(&seen)
+                ),
+            }
+        }
+        seen
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len().max(1)).any(|w| w == needle)
+    }
+
+    /// Extract the pid the child echoed as `pid:<digits>`.
+    fn pid_from(transcript: &[u8]) -> i32 {
+        let text = String::from_utf8_lossy(transcript);
+        let after = text.split("pid:").nth(1).expect("transcript carries pid:");
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().expect("pid digits parse")
+    }
+
+    /// True while `pid` exists in the process table (including as a zombie,
+    /// so a killed-but-unreaped child still counts as leaked).
+    fn process_exists(pid: i32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_until_gone(pid: i32) {
+        let deadline = Instant::now() + DEADLINE;
+        while process_exists(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "child {pid} still exists after teardown: orphaned or unreaped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Spawn a child that outlives any test deadline and report its pid.
+    /// `exec` makes the echoed `$$` the pid of the long-lived process itself,
+    /// so the liveness probe watches the real child, not a shell wrapper.
+    fn spawn_sleeper(rt: &LocalPty) -> (String, i32, Receiver<i32>) {
+        let (sink, out, exit) = sink();
+        let id = rt
+            .spawn(spec("/bin/sh", &["-c", "echo pid:$$; exec sleep 300"]), sink)
+            .expect("spawn sleeper");
+        let transcript = wait_for(&out, |seen| {
+            // Wait for the newline so the pid digits are complete.
+            contains(seen, b"pid:") && seen.ends_with(b"\n")
+        });
+        (id, pid_from(&transcript), exit)
+    }
+
+    /// Issue #35 (1): dropping the runtime must reap a LIVE child. The reader
+    /// and waiter threads each hold an `Arc<Session>` while the child runs,
+    /// so the kill must not depend on the refcount reaching zero — before the
+    /// fix this test times out with the child orphaned, still sleeping.
+    #[test]
+    fn drop_reaps_a_live_child_instead_of_orphaning_it() {
+        let rt = LocalPty::default();
+        let (id, pid, exit) = spawn_sleeper(&rt);
+        assert_eq!(rt.status(&id).unwrap(), SessionStatus::Running);
+        assert!(process_exists(pid), "sleeper must be alive before teardown");
+
+        drop(rt);
+
+        // The waiter thread reaps the killed child and fires on_exit long
+        // before the child's own 300s runtime — the child did not survive.
+        exit.recv_timeout(DEADLINE)
+            .expect("teardown must terminate the live child (on_exit never fired)");
+        wait_until_gone(pid);
+    }
+
+    /// Explicit `shutdown()` (the non-Drop teardown path) reaps live
+    /// children the same way and empties the map: afterwards the id no
+    /// longer resolves. Calling it again is a no-op.
+    #[test]
+    fn shutdown_reaps_live_children_and_clears_the_map() {
+        let rt = LocalPty::default();
+        let (id, pid, exit) = spawn_sleeper(&rt);
+
+        rt.shutdown();
+
+        exit.recv_timeout(DEADLINE)
+            .expect("shutdown must terminate the live child (on_exit never fired)");
+        wait_until_gone(pid);
+        assert!(
+            rt.status(&id).is_err(),
+            "a torn-down session id must no longer resolve"
+        );
+        rt.shutdown(); // idempotent
+    }
+
+    /// Issue #35 (2): exited sessions must be removable from the map so a
+    /// long-lived app does not accumulate scrollback forever. Pruning takes
+    /// only exited sessions; their ids then fail like unknown ids, while
+    /// running sessions keep resolving.
+    #[test]
+    fn prune_exited_removes_exited_sessions_and_keeps_running_ones() {
+        let rt = LocalPty::default();
+
+        // One session that exits immediately...
+        let (done_sink, _done_out, done_exit) = sink();
+        let done = rt
+            .spawn(spec("/bin/sh", &["-c", "exit 3"]), done_sink)
+            .expect("spawn short-lived session");
+        assert_eq!(done_exit.recv_timeout(DEADLINE).expect("exit fires"), 3);
+        // The waiter flips the status before firing on_exit today, but poll
+        // rather than couple the test to that ordering.
+        let deadline = Instant::now() + DEADLINE;
+        while rt.status(&done).expect("status stays queryable until pruned")
+            == SessionStatus::Running
+        {
+            assert!(Instant::now() < deadline, "status never flipped to exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // ...and one that is still running.
+        let (live, live_pid, _live_exit) = spawn_sleeper(&rt);
+
+        assert_eq!(rt.prune_exited(), 1, "exactly the exited session is pruned");
+        assert!(
+            rt.status(&done).is_err(),
+            "a pruned (zombie) id must stop resolving, like any unknown id"
+        );
+        assert!(rt.snapshot(&done).is_err(), "pruned id has no snapshot");
+        assert_eq!(
+            rt.status(&live).expect("running session must survive a prune"),
+            SessionStatus::Running
+        );
+        assert!(process_exists(live_pid), "pruning must not touch live children");
+        assert_eq!(rt.prune_exited(), 0, "nothing left to prune");
+
+        rt.kill(&live).expect("cleanup: kill the sleeper");
     }
 }
