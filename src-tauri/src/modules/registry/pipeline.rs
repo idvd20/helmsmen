@@ -2,10 +2,12 @@
 //! existing seams, in the PRD's order: fetch (optional) → `git worktree
 //! add` off base with the branch template → authorize the workspace root
 //! → copy carry-over globs → run the setup script (user's shell, cwd =
-//! worktree) → write harness wiring (STUB at M2; M3 writes control-plane
-//! hook config through the same `Harness::config_injection` seam) →
-//! launch the first Agent Session (Harness launch command, Profile
-//! model, opening prompt = snippet + Brief).
+//! worktree) → write harness wiring (task #16: a Harness with the
+//! `control_plane_hooks` Cap gets a per-Workspace loopback endpoint started
+//! and its hook config written through the `Harness::config_injection`
+//! seam; a Signal-only Harness keeps agent-signal) → launch the first Agent
+//! Session (Harness launch command, Profile model, opening prompt =
+//! snippet + Brief).
 //!
 //! Split into [`enqueue`] (fast: boundary validation, Slot allocation,
 //! `HELMSMEN_*` env assembly, one registry commit — the only part a
@@ -28,7 +30,8 @@ use crate::modules::core::workspace::{
     expand_branch_template, helmsmen_env, lowest_free_slot, validate_slug, worktree_path,
     Workspace,
 };
-use crate::modules::harness::{Harness, LaunchContext};
+use crate::modules::harness::{ControlPlaneWiring, Harness, LaunchContext};
+use crate::modules::hooks::EndpointRegistry;
 use crate::modules::runtime::spawn::{apply_config_injection, prepare_spawn_with, LaunchOverrides};
 use crate::modules::runtime::{OutputSink, Runtime};
 use crate::modules::workspace::WorkspaceRegistry;
@@ -167,6 +170,7 @@ pub fn run(
     roots: &WorkspaceRegistry,
     runtime: &dyn Runtime,
     harness: &dyn Harness,
+    endpoints: &EndpointRegistry,
     cut: &EnqueuedCut,
 ) {
     let ws = &cut.workspace;
@@ -253,15 +257,46 @@ pub fn run(
         return park(registry, cut, CutStep::SetupScript, log);
     }
 
-    // Step 6: harness wiring — STUB at M2. The step exists, runs, and can
-    // fail (hostile paths are rejected inside the worktree boundary), but
-    // claude-code injects nothing yet: M3 writes the control-plane hook
-    // config through this exact seam (`Harness::config_injection`).
+    // Step 6: harness wiring (task #16). A Harness with the
+    // `control_plane_hooks` Cap gets a per-Workspace loopback endpoint started
+    // here and its hook settings written into the worktree, so the first
+    // Session POSTs its hook events to the control plane under the session
+    // bearer token. A Signal-only Harness (no Cap) starts no endpoint and
+    // writes no hook config — its agent-signal path stays the status source
+    // (Cap degradation). Hostile config paths are still rejected inside the
+    // worktree boundary; a failure to bind parks the cut at this step.
+    let endpoint = if harness.caps().control_plane_hooks {
+        match endpoints.start_for(&ws.id) {
+            Ok(endpoint) => Some(endpoint),
+            Err(e) => {
+                return park(
+                    registry,
+                    cut,
+                    CutStep::HarnessWiring,
+                    format!("cannot start control-plane endpoint: {e}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // Own the url for the borrow the LaunchContext takes; the Arc endpoint
+    // (hence `token()`) stays alive through the injection below, and the
+    // registry keeps its own Arc so the endpoint outlives this cut.
+    let endpoint_url = endpoint.as_ref().map(|e| e.url());
+    let control_plane = match (endpoint.as_ref(), endpoint_url.as_deref()) {
+        (Some(endpoint), Some(url)) => Some(ControlPlaneWiring {
+            url,
+            token: endpoint.token(),
+        }),
+        _ => None,
+    };
     let ctx = LaunchContext {
         workspace_root: &ws.worktree_path,
         env: &cut.env,
         model: &cut.profile.model,
         opening_prompt: &cut.opening_prompt,
+        control_plane,
     };
     if let Err(log) = apply_config_injection(&ws.worktree_path, &harness.config_injection(&ctx)) {
         return park(registry, cut, CutStep::HarnessWiring, log);
@@ -298,8 +333,10 @@ pub fn run(
         },
     ) {
         // The Workspace vanished mid-cut (scuttled): the session just
-        // launched belongs to nothing — kill it, best effort.
+        // launched belongs to nothing — kill it, and drop the control-plane
+        // endpoint so its listener thread does not outlive the Workspace.
         let _ = runtime.kill(&first_session_id);
+        endpoints.remove(&ws.id);
     }
 }
 
@@ -505,6 +542,7 @@ mod tests {
         _tmp: tempfile::TempDir,
         registry: RegistryState,
         roots: WorkspaceRegistry,
+        endpoints: EndpointRegistry,
         repo_root: String,
         worktree_home: String,
     }
@@ -569,6 +607,7 @@ mod tests {
             _tmp: tmp,
             registry,
             roots: WorkspaceRegistry::default(),
+            endpoints: EndpointRegistry::default(),
             repo_root,
             worktree_home,
         }
@@ -734,9 +773,10 @@ mod tests {
         std::thread::scope(|scope| {
             let registry = &f.registry;
             let roots = &f.roots;
+            let endpoints = &f.endpoints;
             let runtime = RecordingRuntime::default();
             let handle = scope.spawn(move || {
-                run(registry, roots, &runtime, &ClaudeCode, &enq);
+                run(registry, roots, &runtime, &ClaudeCode, endpoints, &enq);
             });
 
             // Wait until the pipeline is verifiably mid-flight.
@@ -797,7 +837,7 @@ mod tests {
 
         let enq = enqueue(&f.registry, &request("fix-login", "fix the login page")).unwrap();
         let runtime = RecordingRuntime::default();
-        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &enq);
+        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &f.endpoints, &enq);
 
         let ws = &enq.workspace;
         let wt = Path::new(&ws.worktree_path);
@@ -895,7 +935,7 @@ mod tests {
 
         let enq = enqueue(&f.registry, &request("live", "fix the login page")).unwrap();
         let runtime = LocalPty::default();
-        run(&f.registry, &f.roots, &runtime, &EchoHarness { script }, &enq);
+        run(&f.registry, &f.roots, &runtime, &EchoHarness { script }, &f.endpoints, &enq);
 
         let CutState::Complete { first_session_id } = cut_state(&f) else {
             panic!("cut must complete, got {:?}", cut_state(&f));
@@ -946,6 +986,7 @@ mod tests {
             &f.roots,
             &RecordingRuntime::default(),
             &ClaudeCode,
+            &f.endpoints,
             &enq,
         );
 
@@ -973,6 +1014,7 @@ mod tests {
             &f.roots,
             &RecordingRuntime::default(),
             &ClaudeCode,
+            &f.endpoints,
             &enq,
         );
 
@@ -1009,6 +1051,7 @@ mod tests {
             &f.roots,
             &RecordingRuntime::default(),
             &ClaudeCode,
+            &f.endpoints,
             &enq,
         );
 
@@ -1038,6 +1081,7 @@ mod tests {
             &f.roots,
             &RecordingRuntime::default(),
             &ClaudeCode,
+            &f.endpoints,
             &enq,
         );
 
@@ -1077,6 +1121,7 @@ mod tests {
             &f2.roots,
             &RecordingRuntime::default(),
             &ClaudeCode,
+            &f2.endpoints,
             &enq,
         );
 
@@ -1104,6 +1149,7 @@ mod tests {
             &f.roots,
             &RecordingRuntime::default(),
             &ClaudeCode,
+            &f.endpoints,
             &enq,
         );
 
@@ -1131,6 +1177,7 @@ mod tests {
             &f.roots,
             &RecordingRuntime::default(),
             &harness,
+            &f.endpoints,
             &enq,
         );
 
@@ -1163,6 +1210,7 @@ mod tests {
             &f.roots,
             &RecordingRuntime::default(),
             &harness,
+            &f.endpoints,
             &enq,
         );
 
@@ -1184,11 +1232,275 @@ mod tests {
             fail_spawn: true,
             ..Default::default()
         };
-        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &enq);
+        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &f.endpoints, &enq);
 
         let (step, log) = parked_at(&f);
         assert_eq!(step, CutStep::LaunchSession);
         assert!(log.contains("refused to spawn"), "got: {log}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // task #16 — M3 hook wiring at cut: the control plane replaces
+    // agent-signal for Helmsmen Workspaces; Signal-only Harnesses keep it.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Minimal raw-HTTP client: POST `body` to the cut's loopback endpoint and
+    /// return the response status code. Proves the wire path a real `claude`
+    /// hook would take, with no live agent.
+    fn http_post(port: u16, auth: Option<&str>, body: &str) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::{Ipv4Addr, TcpStream};
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let auth_line = auth
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth_line}\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse::<u16>().ok())
+            .unwrap_or(0)
+    }
+
+    /// The wall status a hook payload implies for the Workspace, hook-driven
+    /// only: parse the payload the way the endpoint does, map it through the
+    /// exact reducer chain the frontend mirrors, and roll it up over the cut.
+    fn status_after(ws: &Workspace, payload: &str) -> WorkspaceStatus {
+        use crate::modules::core::cut::{roll_up_status, session_status_from_signal};
+        use crate::modules::core::control_plane::hook_event_signal;
+        use crate::modules::hooks::parse_hook_event;
+        let (_sid, kind) = parse_hook_event(payload.as_bytes()).expect("payload must parse");
+        let session = hook_event_signal(&kind)
+            .and_then(session_status_from_signal)
+            .into_iter()
+            .collect::<Vec<_>>();
+        roll_up_status(derive_status(ws), &session)
+    }
+
+    const PRE_TOOL_USE: &str = r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"toolu_x"}"#;
+    const PERMISSION: &str = r#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+    const STOP: &str = r#"{"session_id":"s1","hook_event_name":"Stop"}"#;
+
+    #[test]
+    fn cut_wires_claude_code_hooks_to_a_live_endpoint_with_the_right_token() {
+        // AC: the cut writes the hook config, and events arrive with the right
+        // token. A claude-code cut starts a per-Workspace endpoint and writes
+        // hook settings pointing at it under the session bearer token.
+        let f = fixture();
+        let enq = enqueue(&f.registry, &request("hooked", "wire me")).unwrap();
+        run(
+            &f.registry,
+            &f.roots,
+            &RecordingRuntime::default(),
+            &ClaudeCode,
+            &f.endpoints,
+            &enq,
+        );
+        assert!(matches!(cut_state(&f), CutState::Complete { .. }));
+
+        let ws = &enq.workspace;
+        let endpoint = f
+            .endpoints
+            .get(&ws.id)
+            .expect("a control-plane-hooks cut must start an endpoint");
+
+        // The hook config landed in the worktree LOCAL settings file (never
+        // the committed one), pointing at THIS endpoint with THIS token.
+        let settings = std::fs::read_to_string(
+            Path::new(&ws.worktree_path).join(".claude/settings.local.json"),
+        )
+        .expect("cut must write the hook settings");
+        let command = serde_json::from_str::<serde_json::Value>(&settings).unwrap()["hooks"]
+            ["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(command.contains(&endpoint.url()), "hook POSTs to the endpoint");
+        assert!(
+            command.contains(&format!("Bearer {}", endpoint.token())),
+            "hook carries the session bearer token"
+        );
+
+        // A POST bearing that exact token is accepted and renders a card; a
+        // wrong or missing token injects nothing (the #15 gate, live at cut).
+        assert_eq!(
+            http_post(endpoint.port(), Some(&format!("Bearer {}", endpoint.token())), PRE_TOOL_USE),
+            200
+        );
+        assert_eq!(http_post(endpoint.port(), Some("Bearer wrong"), PRE_TOOL_USE), 401);
+        assert_eq!(http_post(endpoint.port(), None, PRE_TOOL_USE), 401);
+        let snap = endpoint.snapshot();
+        assert_eq!(snap.cards.len(), 1, "only the authorized POST injected");
+        assert!(snap.warnings.is_empty());
+    }
+
+    #[test]
+    fn hook_events_flip_the_workspace_working_blocked_done_end_to_end() {
+        // AC/demo: hook-driven only, the agent flips Working → Blocked on a
+        // question → Done on finish. Drive the cut's live endpoint with the
+        // payloads a real claude sends and assert both the derived wall status
+        // and the approval-card lifecycle — no agent-signal in sight.
+        let f = fixture();
+        let enq = enqueue(&f.registry, &request("flip", "drive me")).unwrap();
+        run(
+            &f.registry,
+            &f.roots,
+            &RecordingRuntime::default(),
+            &ClaudeCode,
+            &f.endpoints,
+            &enq,
+        );
+        // The live Workspace after the cut completed (Idle: no signal yet).
+        let ws = f
+            .registry
+            .snapshot()
+            .unwrap()
+            .workspaces
+            .into_iter()
+            .find(|w| w.id == enq.workspace.id)
+            .unwrap();
+        let endpoint = f.endpoints.get(&ws.id).unwrap();
+        let auth = format!("Bearer {}", endpoint.token());
+
+        // A completed cut with no live signal derives as Idle.
+        assert_eq!(derive_status(&ws), WorkspaceStatus::Idle);
+
+        // PreToolUse → Working, and a pending approval card appears.
+        assert_eq!(http_post(endpoint.port(), Some(&auth), PRE_TOOL_USE), 200);
+        assert_eq!(status_after(&ws, PRE_TOOL_USE), WorkspaceStatus::Working);
+        use crate::modules::core::control_plane::CardStatus;
+        assert_eq!(endpoint.snapshot().cards[0].status, CardStatus::Pending);
+
+        // Permission prompt → Blocked ("Needs you"), the card is surfaced.
+        assert_eq!(http_post(endpoint.port(), Some(&auth), PERMISSION), 200);
+        assert_eq!(status_after(&ws, PERMISSION), WorkspaceStatus::Blocked);
+        assert_eq!(status_after(&ws, PERMISSION).display_alias(), "Needs you");
+        assert_eq!(endpoint.snapshot().cards[0].status, CardStatus::Surfaced);
+
+        // Stop → Done ("To review"); the unresolved approval closes unrun.
+        assert_eq!(http_post(endpoint.port(), Some(&auth), STOP), 200);
+        assert_eq!(status_after(&ws, STOP), WorkspaceStatus::Done);
+        assert_eq!(endpoint.snapshot().cards[0].status, CardStatus::ClosedNoRun);
+        assert!(endpoint.snapshot().warnings.is_empty());
+    }
+
+    #[test]
+    fn removing_a_workspace_would_drop_its_endpoint() {
+        // The lifecycle seam the Tauri command uses: an endpoint is live after
+        // a control-plane cut and gone once the Workspace is removed.
+        let f = fixture();
+        let enq = enqueue(&f.registry, &request("temp", "b")).unwrap();
+        run(
+            &f.registry,
+            &f.roots,
+            &RecordingRuntime::default(),
+            &ClaudeCode,
+            &f.endpoints,
+            &enq,
+        );
+        assert!(f.endpoints.get(&enq.workspace.id).is_some());
+        f.endpoints.remove(&enq.workspace.id);
+        assert!(f.endpoints.get(&enq.workspace.id).is_none());
+    }
+
+    /// A Harness with no `control_plane_hooks` Cap (Signal-only): it keeps the
+    /// M2 agent-signal path and never touches the control plane.
+    struct SignalOnlyHarness;
+
+    impl Harness for SignalOnlyHarness {
+        fn id(&self) -> &'static str {
+            "fake-agent"
+        }
+        fn display_name(&self) -> &'static str {
+            "Signal Only"
+        }
+        fn caps(&self) -> Caps {
+            Caps {
+                control_plane_hooks: false,
+                agent_signal: true,
+                ..ClaudeCode.caps()
+            }
+        }
+        fn launch_plan(&self, _ctx: &LaunchContext) -> LaunchPlan {
+            LaunchPlan {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "true".to_string()],
+            }
+        }
+        fn config_injection(&self, _ctx: &LaunchContext) -> Vec<ConfigFile> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_signal_only_harness_starts_no_endpoint_and_keeps_agent_signal() {
+        // AC: a Signal-only Harness still shows status — Cap degradation must
+        // not break. No endpoint is bound, no hook config is written, and the
+        // agent-signal → status reducer still lights the wall.
+        use crate::modules::core::cut::{roll_up_status, session_status_from_signal, SessionSignal};
+
+        let f = fixture();
+        let enq = enqueue(&f.registry, &request("signal", "no hooks")).unwrap();
+        run(
+            &f.registry,
+            &f.roots,
+            &RecordingRuntime::default(),
+            &SignalOnlyHarness,
+            &f.endpoints,
+            &enq,
+        );
+        assert!(matches!(cut_state(&f), CutState::Complete { .. }));
+
+        let ws = f
+            .registry
+            .snapshot()
+            .unwrap()
+            .workspaces
+            .into_iter()
+            .find(|w| w.id == enq.workspace.id)
+            .unwrap();
+        // No control plane for this Workspace at all.
+        assert!(
+            f.endpoints.get(&ws.id).is_none(),
+            "a Signal-only Harness must not start an endpoint"
+        );
+        assert!(
+            !Path::new(&ws.worktree_path)
+                .join(".claude/settings.local.json")
+                .exists(),
+            "no hook config is written without the control_plane_hooks Cap"
+        );
+
+        // The M2 agent-signal path still derives status (unchanged reducer).
+        assert_eq!(
+            roll_up_status(
+                derive_status(&ws),
+                &[session_status_from_signal(SessionSignal::Working).unwrap()]
+            ),
+            WorkspaceStatus::Working
+        );
+        assert_eq!(
+            roll_up_status(
+                derive_status(&ws),
+                &[session_status_from_signal(SessionSignal::Attention).unwrap()]
+            ),
+            WorkspaceStatus::Blocked
+        );
     }
 
     // --- enqueue failures reject synchronously, before a Workspace exists
@@ -1268,7 +1580,7 @@ mod tests {
         assert!(f.registry.snapshot().unwrap().workspaces.is_empty());
 
         let runtime = RecordingRuntime::default();
-        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &enq);
+        run(&f.registry, &f.roots, &runtime, &ClaudeCode, &f.endpoints, &enq);
 
         // The pipeline could not park (nothing to park) — and nothing of
         // its work survives without a registry record.
@@ -1402,7 +1714,7 @@ mod tests {
         // --- cut one Workspace in each Project (the two agents) ---
         let enq_a =
             enqueue(&f.registry, &request("triage-login", "fix login")).unwrap();
-        run(&f.registry, &f.roots, &runtime, &harness, &enq_a);
+        run(&f.registry, &f.roots, &runtime, &harness, &f.endpoints, &enq_a);
 
         let req_b = CutRequest {
             project_id: "prj-2".to_string(),
@@ -1412,7 +1724,7 @@ mod tests {
             fetch: false,
         };
         let enq_b = enqueue(&f.registry, &req_b).unwrap();
-        run(&f.registry, &f.roots, &runtime, &harness, &enq_b);
+        run(&f.registry, &f.roots, &runtime, &harness, &f.endpoints, &enq_b);
 
         // Both cuts completed: the wall would show two Projects × two agents.
         let state = f.registry.snapshot().unwrap();

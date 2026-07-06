@@ -43,6 +43,17 @@ pub struct Caps {
     pub model_select: bool,
 }
 
+/// The per-Workspace control-plane endpoint a Harness with the
+/// `control_plane_hooks` Cap wires its hooks to (task #16). Borrowed loopback
+/// coordinates only; the endpoint itself lives in `modules::hooks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneWiring<'a> {
+    /// Loopback URL the hook config POSTs to (`http://127.0.0.1:<port>/hook`).
+    pub url: &'a str,
+    /// The per-session bearer token the hook must present.
+    pub token: &'a str,
+}
+
 /// Everything a Harness may consult when composing its launch plan or
 /// config injection. Borrowed views only; the Harness cannot mutate the
 /// Workspace through this.
@@ -59,6 +70,11 @@ pub struct LaunchContext<'a> {
     /// snippet with the Brief composed in (task #8). Empty = start
     /// without a prompt (M1 behavior, and every later Session).
     pub opening_prompt: &'a str,
+    /// The Workspace's live control-plane endpoint (task #16), when one is
+    /// running. `None` = no control plane: the M1/M2 stub, or a Signal-only
+    /// Harness (no `control_plane_hooks` Cap) that keeps the agent-signal
+    /// path. A Harness with the Cap writes its hook wiring against this.
+    pub control_plane: Option<ControlPlaneWiring<'a>>,
 }
 
 /// The command a Runtime should spawn: argv only, never a shell string, so

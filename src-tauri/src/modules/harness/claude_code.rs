@@ -1,6 +1,7 @@
 //! The `claude-code` Harness: an interactive `claude` in a PTY.
 
 use super::{Caps, ConfigFile, Harness, LaunchContext, LaunchPlan};
+use crate::modules::hooks::{claude_code_hook_settings, CLAUDE_HOOK_SETTINGS_REL};
 
 /// Full capability set. Declared as a const so the compiler, not a config
 /// file, is the source of truth; adding a `Caps` field forces an explicit
@@ -56,10 +57,20 @@ impl Harness for ClaudeCode {
         }
     }
 
-    /// M3 writes control-plane hook wiring through this seam; at M1 there
-    /// is deliberately nothing to inject.
-    fn config_injection(&self, _ctx: &LaunchContext) -> Vec<ConfigFile> {
-        Vec::new()
+    /// M3 control-plane hook wiring (task #16): when the cut has a running
+    /// per-Workspace endpoint, write the Claude Code hook settings so this
+    /// `claude` POSTs its hook events there under the session bearer token.
+    /// The worktree-LOCAL settings file is used, so the user's and Terax's
+    /// global hooks (a different file Claude Code also merges) keep firing.
+    /// Without an endpoint — the M1/M2 stub — there is nothing to inject.
+    fn config_injection(&self, ctx: &LaunchContext) -> Vec<ConfigFile> {
+        match ctx.control_plane {
+            Some(cp) => vec![ConfigFile {
+                rel_path: CLAUDE_HOOK_SETTINGS_REL.to_string(),
+                contents: claude_code_hook_settings(cp.url, cp.token),
+            }],
+            None => Vec::new(),
+        }
     }
 }
 
@@ -108,6 +119,20 @@ mod tests {
             env,
             model,
             opening_prompt,
+            control_plane: None,
+        }
+    }
+
+    fn wired_ctx<'a>(
+        env: &'a BTreeMap<String, String>,
+        wiring: super::super::ControlPlaneWiring<'a>,
+    ) -> LaunchContext<'a> {
+        LaunchContext {
+            workspace_root: "/tmp/wt/fix-1",
+            env,
+            model: "",
+            opening_prompt: "",
+            control_plane: Some(wiring),
         }
     }
 
@@ -152,11 +177,37 @@ mod tests {
     }
 
     #[test]
-    fn config_injection_seam_exists_and_is_empty_at_m2() {
+    fn config_injection_is_empty_without_a_control_plane() {
+        // No endpoint (the M1/M2 stub, or a Signal-only path): nothing is
+        // written, so the agent-signal source stays the only one.
         let env = ctx_env();
         assert!(ClaudeCode
             .config_injection(&ctx(&env, "", "/tdd x"))
             .is_empty());
+    }
+
+    // --- task #16: with a control plane, the hook wiring is injected ---
+
+    #[test]
+    fn config_injection_writes_the_local_hook_settings_with_the_token() {
+        let env = ctx_env();
+        let wiring = super::super::ControlPlaneWiring {
+            url: "http://127.0.0.1:54321/hook",
+            token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        };
+        let files = ClaudeCode.config_injection(&wired_ctx(&env, wiring));
+        assert_eq!(files.len(), 1, "exactly the hook settings file");
+        // The LOCAL settings file — never the committed one — so the user's
+        // and Terax's global hooks (a different file) are never clobbered.
+        assert_eq!(files[0].rel_path, ".claude/settings.local.json");
+        assert!(!files[0].rel_path.ends_with("/settings.json"));
+        // The contents POST to the endpoint under the session bearer token.
+        let settings: serde_json::Value = serde_json::from_str(&files[0].contents).unwrap();
+        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains(wiring.url));
+        assert!(command.contains(&format!("Authorization: Bearer {}", wiring.token)));
     }
 
     #[test]

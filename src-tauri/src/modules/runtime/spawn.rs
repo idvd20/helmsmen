@@ -67,11 +67,18 @@ pub fn prepare_spawn_with(
     rows: u16,
 ) -> Result<SpawnSpec, String> {
     let base = resolve_workspace_root(registry, roots, workspace_id, cols, rows)?;
+    // The control-plane endpoint is wired by the cut pipeline (task #16): a
+    // Harness with the `control_plane_hooks` Cap already has its hook settings
+    // in the worktree from the cut, and the endpoint stays live in the
+    // `EndpointRegistry`. A later spawn therefore leaves that wiring alone —
+    // `None` here means `claude-code::config_injection` writes nothing and so
+    // never clobbers the cut-written settings file.
     let ctx = LaunchContext {
         workspace_root: &base.worktree,
         env: &base.env,
         model: overrides.model,
         opening_prompt: overrides.opening_prompt,
+        control_plane: None,
     };
     apply_config_injection(&base.worktree, &harness.config_injection(&ctx))?;
     let plan = harness.launch_plan(&ctx);
