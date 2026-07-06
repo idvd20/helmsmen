@@ -261,6 +261,53 @@ export interface HelmApproval {
   input: HelmToolInput;
 }
 
+/** One append-only approval record — a single policy decision, for the audit
+ * trail. Mirrors the backend `core::control_plane::ApprovalRecord`. */
+export interface HelmApprovalRecord {
+  seq: number;
+  sessionId: string;
+  toolName: string;
+  input: HelmToolInput;
+  decision: HelmCardDecision;
+  rule?: HelmCardRule;
+}
+
+/** A Workspace's whole derived control-plane state, as the endpoint
+ * serializes it. Mirrors the backend `core::control_plane::ControlPlaneState`.
+ * `cards` drives the wall's ask blocks and the zoom's inline paused call;
+ * every string is hostile agent/PTY text — render via escaped JSX only. */
+export interface HelmControlPlaneState {
+  cards: HelmApproval[];
+  warnings: string[];
+  eventCount: number;
+  records: HelmApprovalRecord[];
+}
+
+/** How the user answered a paused approval. `deny` carries an optional
+ * reroute instruction that lands as a user message. */
+export type HelmAnswerAction = "allow" | "deny";
+
+/** The result of the ONE send-keys seam. `injected` = the visible dialog
+ * matched the intended card and keys were sent; `mismatch` = it did NOT match,
+ * so nothing was injected (verify-before-inject). Mirrors the backend
+ * `runtime::answer::AnswerOutcome`. */
+export type HelmAnswerOutcome =
+  | { status: "injected" }
+  | { status: "mismatch"; reason: "noDialog" | "dialogNotVisible" };
+
+/** Input to answer a paused approval: the agent Session to inject into, the
+ * card's correlation anchor + exact command (which must be visible on screen
+ * before any key is sent), and the answer. */
+export interface AnswerPromptInput {
+  session: string;
+  runtime?: string;
+  harnessId?: string;
+  toolUseId?: string | null;
+  expectedCommand: string;
+  action: HelmAnswerAction;
+  reason?: string;
+}
+
 /** Stream callbacks for a session. Output is hostile PTY data: treat it
  * as text, never as markup or instructions. */
 export interface AgentStreamHandlers {
@@ -480,6 +527,21 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
       session: session.sessionId,
     });
 
+  /** A snapshot of a Workspace's derived approval state (cards + warnings +
+   * records), or null if it has no running control-plane endpoint. Polled so
+   * pending asks surface as ask cards and a card reconciles after answering. */
+  const approvalsSnapshot = (workspaceId: string) =>
+    invoke<HelmControlPlaneState | null>("helm_approvals_snapshot", {
+      workspaceId,
+    });
+
+  /** Answer a paused approval — the ONE send-keys seam. The backend snapshots
+   * the agent's screen, verifies the visible dialog is the intended card's
+   * (`expectedCommand`), and injects the accept/deny keys ONLY on a match;
+   * a mismatch injects nothing. */
+  const answerPrompt = (input: AnswerPromptInput) =>
+    invoke<HelmAnswerOutcome>("helm_answer_prompt", { input });
+
   return {
     detectProject,
     addProject,
@@ -502,6 +564,8 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
     resizeAgent,
     agentStatus,
     killAgent,
+    approvalsSnapshot,
+    answerPrompt,
   };
 }
 

@@ -148,7 +148,40 @@ pub(crate) fn case_unknown_session_ids_error(rt: &dyn Runtime) {
     assert!(rt.write("ghost", b"x").is_err());
     assert!(rt.resize("ghost", 80, 24).is_err());
     assert!(rt.status("ghost").is_err());
+    assert!(rt.snapshot("ghost").is_err());
     assert!(rt.kill("ghost").is_err());
+}
+
+/// Snapshot returns the current screen (retained scrollback) verbatim without
+/// re-pointing the live sink — the M3.5 `capture-pane` analog the answering
+/// seam reads to verify a dialog before injecting. The live sink keeps
+/// receiving output after a snapshot is taken.
+pub(crate) fn case_snapshot_captures_screen_without_disturbing_the_sink(rt: &dyn Runtime) {
+    let (sink, out, _exit) = sink();
+    let id = rt
+        .spawn(
+            spec(
+                "/bin/sh",
+                &["-c", r#"echo READY; read line; printf 'after:%s\n' "$line""#],
+            ),
+            sink,
+        )
+        .unwrap();
+    wait_for(&out, |seen| contains(seen, b"READY"));
+
+    // The snapshot sees what the live sink saw, delivered verbatim as data.
+    let snap = rt.snapshot(&id).unwrap();
+    assert!(contains(&snap, b"READY"), "snapshot must carry the screen so far");
+
+    // Taking the snapshot did not steal the stream: the original sink keeps
+    // receiving live output.
+    rt.write(&id, b"go\r").unwrap();
+    wait_for(&out, |seen| contains(seen, b"after:go"));
+
+    // A second snapshot reflects the newer output.
+    let later = rt.snapshot(&id).unwrap();
+    assert!(contains(&later, b"after:go"), "snapshot tracks new output");
+    let _ = rt.kill(&id);
 }
 
 /// Attach on a live session: the new sink gets the scrollback first, then
@@ -253,6 +286,7 @@ mod local_pty {
         case_unknown_session_ids_error,
         case_attach_replays_scrollback_then_streams,
         case_attach_after_exit_replays_and_reports_exit,
+        case_snapshot_captures_screen_without_disturbing_the_sink,
         case_hostile_escape_sequences_are_data,
         case_invalid_specs_are_rejected,
     );

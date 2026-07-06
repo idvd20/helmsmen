@@ -276,7 +276,9 @@ pub fn run() {
             runtime::commands::helm_resize_agent,
             runtime::commands::helm_agent_status,
             runtime::commands::helm_kill_agent,
+            runtime::commands::helm_answer_prompt,
             harness::commands::helm_list_harnesses,
+            hooks::commands::helm_approvals_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

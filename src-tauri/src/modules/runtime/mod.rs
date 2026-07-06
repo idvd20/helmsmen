@@ -10,6 +10,7 @@
 //! hostile on every implementation. A Runtime moves bytes; it never
 //! parses or acts on them. The conformance suite pins this.
 
+pub mod answer;
 pub mod commands;
 pub mod local_pty;
 pub mod spawn;
@@ -69,6 +70,15 @@ pub trait Runtime: Send + Sync {
 
     /// Type into the session. Bytes go to the process verbatim.
     fn write(&self, session: &str, bytes: &[u8]) -> Result<(), String>;
+
+    /// A read-only snapshot of the session's current screen — the M3.5
+    /// `capture-pane` analog, generic over every Runtime. Returns the retained
+    /// scrollback bytes verbatim (hostile data; never interpreted here). Unlike
+    /// [`attach`](Self::attach) it does NOT re-point the live sink, so the
+    /// answering seam can verify the visible dialog before injecting any key
+    /// without disturbing the UI's stream. Tmux at M4 implements this as
+    /// `tmux capture-pane`; the conformance suite pins the behavior.
+    fn snapshot(&self, session: &str) -> Result<Vec<u8>, String>;
 
     fn resize(&self, session: &str, cols: u16, rows: u16) -> Result<(), String>;
 

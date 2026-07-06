@@ -16,6 +16,8 @@ export type ZoomAction =
   | { kind: "switch-tab"; index: number }
   | { kind: "hop-workspace"; delta: -1 | 1 }
   | { kind: "focus-message" }
+  | { kind: "answer-allow" }
+  | { kind: "answer-deny" }
   | { kind: "none" };
 
 /** The subset of a KeyboardEvent the map reads. Modelled as plain data so
@@ -55,8 +57,10 @@ export function hopWorkspaceIndex(
 }
 
 /** Map a key press to a zoom action. Modified chords (Ctrl/Meta/Alt) and
- * every key while typing a message are left for the terminal / field —
- * the raw escape hatch to the live PTY is never shadowed. */
+ * every key while typing a message or a deny reason are left for the terminal
+ * / field — the raw escape hatch to the live PTY is never shadowed. `a`/`x`
+ * answer a paused approval inline (Allow / Deny); steering (`m`) stays
+ * decoupled, usable any time. */
 export function mapZoomKey(
   ev: ZoomKeyInput,
   ctx: ZoomKeyContext,
@@ -73,6 +77,10 @@ export function mapZoomKey(
       return { kind: "hop-workspace", delta: 1 };
     case "m":
       return { kind: "focus-message" };
+    case "a":
+      return { kind: "answer-allow" };
+    case "x":
+      return { kind: "answer-deny" };
     default: {
       const index = tabIndexForDigit(ev.key, ctx.tabCount);
       return index == null

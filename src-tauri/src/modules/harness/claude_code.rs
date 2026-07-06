@@ -1,6 +1,10 @@
 //! The `claude-code` Harness: an interactive `claude` in a PTY.
 
-use super::{Caps, ConfigFile, Harness, LaunchContext, LaunchPlan};
+use super::answer::claude_code_answer_plan;
+use super::{
+    Caps, ConfigFile, Harness, IntendedDialog, KeyStep, LaunchContext, LaunchPlan, Mismatch,
+    PromptAnswer,
+};
 use crate::modules::hooks::{claude_code_hook_settings, CLAUDE_HOOK_SETTINGS_REL};
 
 /// Full capability set. Declared as a const so the compiler, not a config
@@ -71,6 +75,18 @@ impl Harness for ClaudeCode {
             }],
             None => Vec::new(),
         }
+    }
+
+    /// The ONE fragile seam's pure core, for Claude Code: match the visible
+    /// permission dialog against the intended card and, only on a match, return
+    /// the accept/deny key sequence (see [`claude_code_answer_plan`]).
+    fn answer_plan(
+        &self,
+        snapshot: &[u8],
+        dialog: &IntendedDialog,
+        answer: &PromptAnswer,
+    ) -> Result<Vec<KeyStep>, Mismatch> {
+        claude_code_answer_plan(snapshot, dialog, answer)
     }
 }
 

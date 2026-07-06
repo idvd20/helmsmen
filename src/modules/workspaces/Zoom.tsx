@@ -14,22 +14,30 @@
 
 import {
   type CSSProperties,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import type { HelmApi, HelmProcessDef } from "@/modules/helm/api";
+import type { HelmApi, HelmApproval, HelmProcessDef } from "@/modules/helm/api";
 import { mapZoomKey } from "./keymap";
 import { PtyPane } from "./PtyPane";
 import { sessionStore } from "./sessionStore";
 import {
+  derivePausedCalls,
   groupSessions,
   messageToPtyLine,
+  type PausedCall,
+  pickAgentSession,
   processDefLabel,
   type ZoomSession,
   type ZoomTarget,
 } from "./zoomModel";
+
+/** How often the zoom re-reads the Workspace's approval state so a newly
+ * paused call surfaces inline (and answered ones clear). */
+const APPROVALS_POLL_MS = 1200;
 
 export interface ZoomProps {
   api: HelmApi;
@@ -46,7 +54,14 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
   const [messageText, setMessageText] = useState("");
   const [liveSessions, setLiveSessions] = useState(() => sessionStore.list());
   const [processes, setProcesses] = useState<HelmProcessDef[]>([]);
+  const [approvals, setApprovals] = useState<HelmApproval[]>([]);
+  // The paused call whose Deny reason is being typed (null = box closed). `x`
+  // targets the top call; a card's Deny button targets that card.
+  const [denyTarget, setDenyTarget] = useState<PausedCall | null>(null);
+  const [denyText, setDenyText] = useState("");
+  const [answerNote, setAnswerNote] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const denyRef = useRef<HTMLInputElement>(null);
 
   // Live Session set: a Session added or killed from the zoom appears /
   // disappears here at once, so the tab bar tracks it without waiting on the
@@ -65,16 +80,47 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
   }, [liveSessions, target.workspaceId, target.tabs]);
 
   // A new target (a `[`/`]` hop or a fresh zoom) resets the active tab and
-  // closes any open message box.
+  // closes any open message / deny box.
   useEffect(() => {
     setActiveIndex(target.activeIndex);
     setMessageOpen(false);
     setMessageText("");
+    setDenyTarget(null);
+    setDenyText("");
+    setAnswerNote(null);
+    setApprovals([]);
   }, [target]);
+
+  const denyOpen = denyTarget !== null;
 
   useEffect(() => {
     if (messageOpen) inputRef.current?.focus();
   }, [messageOpen]);
+
+  useEffect(() => {
+    if (denyOpen) denyRef.current?.focus();
+  }, [denyOpen]);
+
+  // Poll the Workspace's approval state so a paused call surfaces inline (and
+  // clears once answered). Snapshot of the control-plane endpoint; a null (no
+  // endpoint) or a transient failure just leaves the last set.
+  useEffect(() => {
+    let live = true;
+    const tick = async () => {
+      try {
+        const state = await api.approvalsSnapshot(target.workspaceId);
+        if (live) setApprovals(state?.cards ?? []);
+      } catch {
+        // transient invoke failure — keep the last snapshot
+      }
+    };
+    void tick();
+    const id = setInterval(tick, APPROVALS_POLL_MS);
+    return () => {
+      live = false;
+      clearInterval(id);
+    };
+  }, [api, target.workspaceId]);
 
   // The Project's Process definitions for the add-session menu. Resolved
   // through the api (workspace -> project -> settings.processes); a raw
@@ -99,8 +145,65 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
     };
   }, [api, target.workspaceId]);
 
-  // The single zoom keyboard listener. `editing` yields the whole keyboard
-  // to the message box when it is open.
+  // Paused approvals for this Workspace (inline Allow/Deny). `a`/`x` act on
+  // the TOP (oldest open) call; the agent Session is where keys inject.
+  const pausedCalls = useMemo(() => derivePausedCalls(approvals), [approvals]);
+  const topCall = pausedCalls[0] ?? null;
+  const agentSession = useMemo(() => pickAgentSession(tabs), [tabs]);
+
+  const refreshApprovals = useCallback(async () => {
+    try {
+      const state = await api.approvalsSnapshot(target.workspaceId);
+      setApprovals(state?.cards ?? []);
+    } catch {
+      // keep the last snapshot
+    }
+  }, [api, target.workspaceId]);
+
+  // Answer a paused call — the ONE seam, over the invoke boundary. On a
+  // mismatch the backend injected nothing (the visible dialog was not this
+  // card's); surface that instead of pretending it resolved. Always re-poll so
+  // the card reconciles by tool_use_id.
+  const answerCall = useCallback(
+    async (call: PausedCall, action: "allow" | "deny", reason?: string) => {
+      if (!agentSession) {
+        setAnswerNote("no agent session in this workspace to answer");
+        return;
+      }
+      setAnswerNote(null);
+      try {
+        const outcome = await api.answerPrompt({
+          session: agentSession.sessionId,
+          runtime: agentSession.runtime,
+          toolUseId: call.toolUseId,
+          expectedCommand: call.command,
+          action,
+          reason,
+        });
+        if (outcome.status === "mismatch") {
+          setAnswerNote("dialog changed — not answered; re-check the call");
+        }
+      } catch {
+        setAnswerNote("could not reach the agent");
+      }
+      void refreshApprovals();
+    },
+    [agentSession, api, refreshApprovals],
+  );
+
+  const allowCall = useCallback(
+    (call: PausedCall) => void answerCall(call, "allow"),
+    [answerCall],
+  );
+  const submitDeny = useCallback(() => {
+    if (denyTarget)
+      void answerCall(denyTarget, "deny", denyText.trim() || undefined);
+    setDenyTarget(null);
+    setDenyText("");
+  }, [denyTarget, denyText, answerCall]);
+
+  // The single zoom keyboard listener. `editing` yields the whole keyboard to
+  // the message box or the deny-reason box when either is open.
   useEffect(() => {
     const onKeyDown = (ev: KeyboardEvent) => {
       const action = mapZoomKey(
@@ -110,7 +213,7 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
           metaKey: ev.metaKey,
           altKey: ev.altKey,
         },
-        { tabCount: tabs.length, editing: messageOpen },
+        { tabCount: tabs.length, editing: messageOpen || denyOpen },
       );
       if (action.kind === "none") return;
       ev.preventDefault();
@@ -127,11 +230,25 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
         case "focus-message":
           setMessageOpen(true);
           break;
+        case "answer-allow":
+          if (topCall) allowCall(topCall);
+          break;
+        case "answer-deny":
+          if (topCall) setDenyTarget(topCall);
+          break;
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [tabs.length, messageOpen, onReturn, onHopWorkspace]);
+  }, [
+    tabs.length,
+    messageOpen,
+    denyOpen,
+    topCall,
+    allowCall,
+    onReturn,
+    onHopWorkspace,
+  ]);
 
   // Clamp the active tab into the live set: killing a Session shrinks the
   // tabs, so an out-of-range index falls back to the last remaining tab.
@@ -185,6 +302,17 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
     } else if (ev.key === "Escape") {
       ev.preventDefault();
       setMessageOpen(false);
+    }
+  };
+
+  const onDenyKeyDown = (ev: React.KeyboardEvent<HTMLInputElement>) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      submitDeny();
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      setDenyTarget(null);
+      setDenyText("");
     }
   };
 
@@ -256,6 +384,56 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
       ) : (
         <div style={emptyStyle}>no session</div>
       )}
+
+      {pausedCalls.length > 0 ? (
+        <div style={approvalBarStyle} aria-label="paused approvals">
+          {pausedCalls.map((call, index) => (
+            <div
+              key={call.id}
+              style={index === 0 ? approvalCardTopStyle : approvalCardStyle}
+            >
+              <div style={approvalMetaStyle}>
+                <span style={approvalToolStyle}>⏸ {call.tool}</span>
+                <span style={approvalRuleStyle}>{call.rule}</span>
+                {index === 0 ? (
+                  <span style={approvalHintStyle}>a allow · x deny</span>
+                ) : null}
+              </div>
+              {/* Hostile agent text: rendered as an escaped JSX text node,
+                  never an HTML sink. */}
+              <code style={approvalCmdStyle}>{call.command}</code>
+              <div style={approvalActionsStyle}>
+                <button
+                  type="button"
+                  style={allowBtnStyle}
+                  onClick={() => allowCall(call)}
+                >
+                  Allow
+                </button>
+                <button
+                  type="button"
+                  style={denyBtnStyle}
+                  onClick={() => setDenyTarget(call)}
+                >
+                  Deny
+                </button>
+              </div>
+            </div>
+          ))}
+          {answerNote ? <div style={answerNoteStyle}>{answerNote}</div> : null}
+          {denyOpen ? (
+            <input
+              ref={denyRef}
+              style={inputStyle}
+              value={denyText}
+              aria-label="deny reason"
+              placeholder="why — the agent reroutes with this (↵ deny · esc cancel)"
+              onChange={(ev) => setDenyText(ev.target.value)}
+              onKeyDown={onDenyKeyDown}
+            />
+          ) : null}
+        </div>
+      ) : null}
 
       {messageOpen ? (
         <div style={messageBarStyle}>
@@ -401,6 +579,99 @@ const emptyStyle: CSSProperties = {
   display: "grid",
   placeItems: "center",
   color: "#5b6273",
+};
+
+const approvalBarStyle: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 8,
+  padding: 10,
+  borderTop: "1px solid #3a1c20",
+  background: "#160c0e",
+};
+
+const approvalCardStyle: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 6,
+  padding: "8px 10px",
+  background: "#0b0e14",
+  border: "1px solid #2d3343",
+  borderRadius: 6,
+};
+
+const approvalCardTopStyle: CSSProperties = {
+  ...approvalCardStyle,
+  border: "1px solid #e5484d",
+};
+
+const approvalMetaStyle: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  flexWrap: "wrap",
+};
+
+const approvalToolStyle: CSSProperties = {
+  color: "#e5484d",
+  fontWeight: 700,
+  font: "12px/1 ui-monospace, monospace",
+};
+
+const approvalRuleStyle: CSSProperties = {
+  color: "#f5a623",
+  fontSize: 11,
+};
+
+const approvalHintStyle: CSSProperties = {
+  marginLeft: "auto",
+  color: "#5b6273",
+  fontSize: 11,
+  font: "11px/1 ui-monospace, monospace",
+};
+
+const approvalCmdStyle: CSSProperties = {
+  display: "block",
+  padding: "6px 8px",
+  background: "#05070b",
+  border: "1px solid #1b2130",
+  borderRadius: 4,
+  color: "#d7dae0",
+  font: "12px/1.4 ui-monospace, monospace",
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-all",
+};
+
+const approvalActionsStyle: CSSProperties = {
+  display: "flex",
+  gap: 8,
+};
+
+const allowBtnStyle: CSSProperties = {
+  padding: "4px 14px",
+  background: "#123524",
+  border: "1px solid #30a46c",
+  borderRadius: 4,
+  color: "#4fd18b",
+  cursor: "pointer",
+  font: "12px/1 ui-sans-serif, system-ui, sans-serif",
+  fontWeight: 600,
+};
+
+const denyBtnStyle: CSSProperties = {
+  padding: "4px 14px",
+  background: "#2a1214",
+  border: "1px solid #e5484d",
+  borderRadius: 4,
+  color: "#ff7a7f",
+  cursor: "pointer",
+  font: "12px/1 ui-sans-serif, system-ui, sans-serif",
+  fontWeight: 600,
+};
+
+const answerNoteStyle: CSSProperties = {
+  color: "#f5a623",
+  fontSize: 11,
 };
 
 const messageBarStyle: CSSProperties = {

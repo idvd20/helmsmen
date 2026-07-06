@@ -6,7 +6,11 @@
 // hop. Deterministic over data — no clock, no DOM, no process — so the
 // zoom's navigation is CI-checked even though its React shell is not.
 
-import type { HelmProcessDef, HelmSession } from "@/modules/helm/api";
+import type {
+  HelmApproval,
+  HelmProcessDef,
+  HelmSession,
+} from "@/modules/helm/api";
 import { hopWorkspaceIndex } from "./keymap";
 
 export type ZoomSessionKind = "agent" | "shell" | "process" | "reviewer";
@@ -169,4 +173,54 @@ export function firstZoomTarget(
  * it is written to the process verbatim, never interpreted. */
 export function messageToPtyLine(text: string): string {
   return `${text}\r`;
+}
+
+// --- inline approval answering (task #18) ---
+
+/** A paused approval, distilled for the zoom's inline Allow/Deny block. Unlike
+ * the wall's `ApprovalAskView` it keeps `toolUseId` (the reconciliation anchor
+ * the answer seam passes back) alongside the exact command (which must be
+ * visible on screen before any key injects). Every string is hostile agent
+ * text — render via escaped JSX only. */
+export interface PausedCall {
+  /** Stable card id — the correlation key. */
+  id: string;
+  /** The correlation anchor the control plane reconciles by. */
+  toolUseId: string | null;
+  /** The tool that paused, e.g. `Bash`. */
+  tool: string;
+  /** The human label of the risk rule that fired. */
+  rule: string;
+  /** The exact command (or file path) the decision was made on, and the
+   * string the backend verifies is on screen before injecting. */
+  command: string;
+}
+
+/** The still-open paused approvals for the zoomed Workspace: only policy `ask`
+ * cards (allow/deny are the audit trail) not yet resolved (pending/surfaced),
+ * in incoming (seq) order. Pure and total; safe on an absent/empty list. */
+export function derivePausedCalls(
+  approvals: HelmApproval[] | undefined,
+): PausedCall[] {
+  if (!approvals) return [];
+  return approvals
+    .filter(
+      (a) =>
+        a.decision === "ask" &&
+        (a.status === "pending" || a.status === "surfaced"),
+    )
+    .map((a) => ({
+      id: a.id,
+      toolUseId: a.toolUseId,
+      tool: a.toolName,
+      rule: a.rule?.label ?? "risk-list rule",
+      command: a.input.command ?? a.input.filePath ?? "",
+    }));
+}
+
+/** The Session keys inject into when answering a paused approval: the zoomed
+ * Workspace's Agent Session (the interactive `claude` whose PTY holds the
+ * dialog), never a shell/process tab. The first agent tab, or null if none. */
+export function pickAgentSession(tabs: ZoomSession[]): ZoomSession | null {
+  return tabs.find((t) => t.kind === "agent") ?? null;
 }

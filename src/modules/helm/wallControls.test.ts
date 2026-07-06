@@ -297,9 +297,14 @@ describe("mapHelmWallKey — `f` / `g` / `r` / esc", () => {
     });
   });
 
+  it("maps `a`/`x` to Allow/Deny of the selected/blocked card (task #18)", () => {
+    expect(mapHelmWallKey({ key: "a" }, base)).toEqual({ kind: "answer-allow" });
+    expect(mapHelmWallKey({ key: "x" }, base)).toEqual({ kind: "answer-deny" });
+  });
+
   it("yields while a field is focused (letters must type)", () => {
     const ctx = { ...base, editing: true };
-    for (const key of ["f", "g", "r", "Escape"]) {
+    for (const key of ["f", "g", "r", "a", "x", "Escape"]) {
       expect(mapHelmWallKey({ key }, ctx)).toEqual({ kind: "none" });
     }
   });
@@ -307,6 +312,8 @@ describe("mapHelmWallKey — `f` / `g` / `r` / esc", () => {
   it("yields entirely while an overlay (Zoom / New Workspace) is open", () => {
     const ctx = { ...base, overlayActive: true };
     expect(mapHelmWallKey({ key: "f" }, ctx)).toEqual({ kind: "none" });
+    expect(mapHelmWallKey({ key: "a" }, ctx)).toEqual({ kind: "none" });
+    expect(mapHelmWallKey({ key: "x" }, ctx)).toEqual({ kind: "none" });
     expect(mapHelmWallKey({ key: "Escape" }, ctx)).toEqual({ kind: "none" });
   });
 
@@ -317,9 +324,15 @@ describe("mapHelmWallKey — `f` / `g` / `r` / esc", () => {
     expect(mapHelmWallKey({ key: "f", ctrlKey: true }, base)).toEqual({
       kind: "none",
     });
+    expect(mapHelmWallKey({ key: "a", metaKey: true }, base)).toEqual({
+      kind: "none",
+    });
+    expect(mapHelmWallKey({ key: "x", ctrlKey: true }, base)).toEqual({
+      kind: "none",
+    });
   });
 
-  it("while the picker is open, `r`/esc close it and f/g are inert", () => {
+  it("while the picker is open, `r`/esc close it and f/g/a/x are inert", () => {
     const ctx = { ...base, pickerOpen: true };
     expect(mapHelmWallKey({ key: "r" }, ctx)).toEqual({
       kind: "close-repo-picker",
@@ -329,5 +342,7 @@ describe("mapHelmWallKey — `f` / `g` / `r` / esc", () => {
     });
     expect(mapHelmWallKey({ key: "f" }, ctx)).toEqual({ kind: "none" });
     expect(mapHelmWallKey({ key: "g" }, ctx)).toEqual({ kind: "none" });
+    expect(mapHelmWallKey({ key: "a" }, ctx)).toEqual({ kind: "none" });
+    expect(mapHelmWallKey({ key: "x" }, ctx)).toEqual({ kind: "none" });
   });
 });

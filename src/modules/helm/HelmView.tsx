@@ -27,6 +27,7 @@ import {
   reduceAgentSignal,
 } from "./agentSignal";
 import {
+  type HelmApproval,
   createHelmApi,
   type HelmProfile,
   type HelmProject,
@@ -37,6 +38,23 @@ import { buildWall, type WallView, type WorkspaceFacts } from "./viewModel";
 
 const WORKSPACE_POLL_MS = 1500;
 const CLOCK_TICK_MS = 30_000;
+
+/** Cheap change check for a Workspace's approval cards, so an unchanged poll
+ * doesn't churn `facts` (and re-derive the whole wall). Compares the fields the
+ * wall reads: id, status, and decision. */
+function approvalsEqual(
+  a: HelmApproval[] | undefined,
+  b: HelmApproval[],
+): boolean {
+  if (a === undefined) return false;
+  if (a.length !== b.length) return false;
+  return a.every(
+    (card, i) =>
+      card.id === b[i].id &&
+      card.status === b[i].status &&
+      card.decision === b[i].decision,
+  );
+}
 
 export interface HelmViewProps {
   /** Zoom to a Session. Defaults to a logging placeholder; #12 wires the
@@ -98,6 +116,50 @@ export function HelmView({ onZoomSession, keyboardActive = true }: HelmViewProps
         });
       } catch {
         // A transient invoke failure just skips this poll.
+      }
+    };
+    void tick();
+    const id = setInterval(tick, WORKSPACE_POLL_MS);
+    return () => {
+      live = false;
+      clearInterval(id);
+    };
+  }, [api]);
+
+  // Live approvals → facts (task #18): poll each Workspace's control-plane
+  // snapshot so the running reducer's pending asks surface as ask cards on the
+  // wall (an open `ask` forces Blocked + the ask block; answering clears it).
+  // A null snapshot (no endpoint) or a transient failure leaves the last set.
+  useEffect(() => {
+    let live = true;
+    const tick = async () => {
+      try {
+        const ws = await api.listWorkspaces();
+        const snaps = await Promise.all(
+          ws.map(async (w) => {
+            try {
+              const state = await api.approvalsSnapshot(w.id);
+              return [w.id, state?.cards ?? []] as const;
+            } catch {
+              return [w.id, null] as const;
+            }
+          }),
+        );
+        if (!live) return;
+        setFacts((prev) => {
+          let changed = false;
+          const next = { ...prev };
+          for (const [id, cards] of snaps) {
+            if (cards === null) continue; // keep the last snapshot
+            const existing = next[id] ?? {};
+            if (approvalsEqual(existing.approvals, cards)) continue;
+            next[id] = { ...existing, approvals: cards };
+            changed = true;
+          }
+          return changed ? next : prev;
+        });
+      } catch {
+        // a transient listWorkspaces failure just skips this poll
       }
     };
     void tick();

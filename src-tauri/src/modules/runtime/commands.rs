@@ -11,9 +11,11 @@ use tauri::ipc::{Channel, Response};
 use tauri::State;
 
 use crate::modules::core::session::SessionKind;
+use crate::modules::harness::{self, IntendedDialog, PromptAnswer};
 use crate::modules::registry::RegistryState;
 use crate::modules::workspace::WorkspaceRegistry;
 
+use super::answer::{answer_prompt, AnswerOutcome};
 use super::spawn::{prepare_process_spawn, prepare_shell_spawn, prepare_spawn};
 use super::{OutputSink, RuntimeState, SessionStatus, LOCAL_PTY};
 
@@ -294,4 +296,72 @@ pub fn helm_kill_agent(
     runtimes
         .get(runtime.as_deref().unwrap_or(LOCAL_PTY))?
         .kill(&session)
+}
+
+/// Whether the user Allowed or Denied a paused approval.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnswerAction {
+    Allow,
+    Deny,
+}
+
+/// Input to the ONE send-keys seam. The frontend names the agent session and
+/// the card being answered — `expectedCommand` (the exact command the card
+/// showed) is what the backend must see on screen before injecting any key,
+/// and `toolUseId` is the correlation anchor for post-hoc reconciliation.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerPromptInput {
+    /// The agent Session's opaque runtime id (keys inject here).
+    pub session: String,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub harness_id: Option<String>,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// The exact command/file the card showed; must be visible on screen.
+    pub expected_command: String,
+    pub action: AnswerAction,
+    /// Deny reroute instruction (lands as a user message). Ignored for Allow.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Answer a paused approval by injecting keys into the agent's PTY — the ONE
+/// fragile seam. Snapshots the session, verifies the visible dialog is the
+/// intended card's, and injects the accept/deny key sequence only on a match
+/// (a mismatch injects nothing). Runs off the IPC thread because the deny
+/// sequence carries settle delays.
+#[tauri::command]
+pub async fn helm_answer_prompt(
+    runtimes: State<'_, RuntimeState>,
+    input: AnswerPromptInput,
+) -> Result<AnswerOutcome, String> {
+    let runtime = runtimes.get(input.runtime.as_deref().unwrap_or(LOCAL_PTY))?;
+    let harness_id = input.harness_id.unwrap_or_else(|| "claude-code".to_string());
+    let harness =
+        harness::by_id(&harness_id).ok_or_else(|| format!("unknown harness {harness_id:?}"))?;
+    let answer = match input.action {
+        AnswerAction::Allow => PromptAnswer::Allow,
+        AnswerAction::Deny => PromptAnswer::Deny {
+            reason: input.reason.unwrap_or_default(),
+        },
+    };
+    let session = input.session;
+    let expected = input.expected_command;
+    let tool_use_id = input.tool_use_id;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let dialog = IntendedDialog {
+            tool_use_id: tool_use_id.as_deref(),
+            expected_command: &expected,
+        };
+        answer_prompt(runtime.as_ref(), harness, &session, &dialog, &answer, |ms| {
+            std::thread::sleep(std::time::Duration::from_millis(ms))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
