@@ -17,6 +17,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { HelmProject, HelmWorkspaceStatus } from "./api";
 import {
   applyScope,
+  type BulkApprovalsView,
   cycleFilter,
   cycleGroup,
   deriveFilterTabs,
@@ -25,6 +26,7 @@ import {
   type GroupMode,
   groupCards,
   mapHelmWallKey,
+  nextAllowAllConfirm,
   type RepoPickerEntry,
   type WallFilter,
   type WallGroup,
@@ -54,6 +56,18 @@ export interface HelmProps {
   /** Zoom to a Session (chip click). Placeholder target now; #12 owns
    * the zoom view and takes this over. */
   onZoomSession?: (sessionId: string) => void;
+  /** The bulk-approvals banner model (task #19): count + one-line preview of
+   * every pending ask. The banner renders between the toolbar and the grid
+   * only when `bulk.visible` (>1 pending). The container derives it from the
+   * same pending queue the cards read. */
+  bulk?: BulkApprovalsView;
+  /** Bulk Allow-all — the container answers every pending ask (verify-before-
+   * inject `answer_prompt` per card) and logs the bulk decision distinctly.
+   * Guarded by the banner's two-press confirm. */
+  onBulkAllow?: () => void;
+  /** Bulk Deny-all — the container denies every pending ask. Single action
+   * (no confirm). */
+  onBulkDeny?: () => void;
 }
 
 function isEditable(el: Element | null): boolean {
@@ -72,12 +86,37 @@ export function Helm({
   projects = [],
   keyboardActive = true,
   onZoomSession,
+  bulk,
+  onBulkAllow,
+  onBulkDeny,
 }: HelmProps) {
   const { counts, cards } = wall;
   const [filter, setFilter] = useState<WallFilter>("all");
   const [group, setGroup] = useState<GroupMode>("flat");
   const [scope, setScope] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Two-press confirm for Allow-all: the first press/click arms it, the second
+  // fires. Deny-all is a single action.
+  const [allowArmed, setAllowArmed] = useState(false);
+
+  const bulkVisible = bulk?.visible ?? false;
+
+  // A vanished banner (all pending answered) must never leave a stale armed
+  // confirm behind for the next queue.
+  useEffect(() => {
+    if (!bulkVisible) setAllowArmed(false);
+  }, [bulkVisible]);
+
+  const fireBulkAllow = useCallback(() => {
+    const { armed, fire } = nextAllowAllConfirm(allowArmed);
+    setAllowArmed(armed);
+    if (fire) onBulkAllow?.();
+  }, [allowArmed, onBulkAllow]);
+
+  const fireBulkDeny = useCallback(() => {
+    setAllowArmed(false);
+    onBulkDeny?.();
+  }, [onBulkDeny]);
 
   // Scope → filter tabs (counts within scope) → filtered → grouped. The
   // repo picker reads the FULL, unscoped/unfiltered set so each repo's live
@@ -126,6 +165,14 @@ export function Helm({
         },
       );
       if (action.kind === "none") return;
+      // Bulk keys act only while the banner is showing (>1 pending); otherwise
+      // let the press fall through untouched (don't swallow it).
+      if (
+        (action.kind === "bulk-allow-all" || action.kind === "bulk-deny-all") &&
+        !bulkVisible
+      ) {
+        return;
+      }
       ev.preventDefault();
       switch (action.kind) {
         case "cycle-filter":
@@ -141,14 +188,21 @@ export function Helm({
           setPickerOpen(false);
           break;
         case "clear-filters":
+          setAllowArmed(false);
           setFilter("all");
           setScope(null);
+          break;
+        case "bulk-allow-all":
+          fireBulkAllow();
+          break;
+        case "bulk-deny-all":
+          fireBulkDeny();
           break;
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [keyboardActive, pickerOpen]);
+  }, [keyboardActive, pickerOpen, bulkVisible, fireBulkAllow, fireBulkDeny]);
 
   return (
     <div style={wallStyle}>
@@ -276,6 +330,15 @@ export function Helm({
         </button>
       </div>
 
+      {bulk?.visible ? (
+        <BulkBanner
+          bulk={bulk}
+          allowArmed={allowArmed}
+          onAllow={fireBulkAllow}
+          onDeny={fireBulkDeny}
+        />
+      ) : null}
+
       {cards.length === 0 ? (
         <p style={emptyStyle}>nothing here — cut a Workspace to begin</p>
       ) : visible.length === 0 ? (
@@ -327,6 +390,71 @@ function RepoRow({
         <span style={dropdownCountStyle}>{entry.count}</span>
       </button>
     </li>
+  );
+}
+
+/** The bulk-approvals banner (task #19): rendered between the toolbar and the
+ * grid when >1 approval is pending. Shows the live count, a one-line preview of
+ * every pending ask, and the bulk Allow-all (two-press) / Deny-all actions.
+ * Per-approval decisions stay on the cards; the banner hosts bulk only. Every
+ * preview string is hostile agent text and reaches the DOM as an escaped JSX
+ * text node — never an HTML sink. */
+function BulkBanner({
+  bulk,
+  allowArmed,
+  onAllow,
+  onDeny,
+}: {
+  bulk: BulkApprovalsView;
+  allowArmed: boolean;
+  onAllow: () => void;
+  onDeny: () => void;
+}) {
+  return (
+    <section style={bannerStyle} aria-label="Pending approvals">
+      <div style={bannerHeadStyle}>
+        <span style={bannerCountStyle} aria-live="polite">
+          ⏸ {bulk.count} approvals waiting
+        </span>
+        <span style={spacerStyle} />
+        <button
+          type="button"
+          style={{
+            ...bannerAllowStyle,
+            ...(allowArmed ? bannerAllowArmedStyle : null),
+          }}
+          aria-pressed={allowArmed}
+          title="Allow all (A · press twice to confirm)"
+          onClick={onAllow}
+        >
+          {allowArmed ? "Press again to allow all" : "Allow all"}
+        </button>
+        <button
+          type="button"
+          style={bannerDenyStyle}
+          title="Deny all (X)"
+          onClick={onDeny}
+        >
+          Deny all
+        </button>
+      </div>
+      <ul style={bannerListStyle}>
+        {bulk.previews.map((preview) => (
+          <li key={preview.id} style={bannerRowStyle} title={preview.command}>
+            <span aria-hidden style={bannerPauseStyle}>
+              ⏸
+            </span>
+            <span style={bannerRepoStyle}>
+              {preview.projectName} ⎇ {preview.branch}
+            </span>
+            <span style={bannerRuleStyle}>
+              {preview.tool} · {preview.rule}
+            </span>
+            <span style={bannerCommandStyle}>{preview.command}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
@@ -506,6 +634,97 @@ const groupButtonStyle: CSSProperties = {
   color: MUTED,
   font: "12px/1 ui-sans-serif, system-ui, sans-serif",
   cursor: "pointer",
+};
+
+// --- bulk-approvals banner (task #19) ---
+
+const bannerStyle: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 6,
+  padding: "10px 16px",
+  background: "#1a1013",
+  borderBottom: "1px solid #4a2327",
+};
+
+const bannerHeadStyle: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+};
+
+const bannerCountStyle: CSSProperties = {
+  fontWeight: 700,
+  color: "#f2b8bb",
+  fontVariantNumeric: "tabular-nums",
+};
+
+const bannerAllowStyle: CSSProperties = {
+  padding: "4px 12px",
+  background: "transparent",
+  border: "1px solid #2d3343",
+  borderRadius: 6,
+  color: "#d7dae0",
+  font: "12px/1 ui-sans-serif, system-ui, sans-serif",
+  fontWeight: 600,
+  cursor: "pointer",
+};
+
+const bannerAllowArmedStyle: CSSProperties = {
+  background: "#30a46c",
+  border: "1px solid #30a46c",
+  color: "#04130b",
+};
+
+const bannerDenyStyle: CSSProperties = {
+  padding: "4px 12px",
+  background: "transparent",
+  border: "1px solid #4a2327",
+  borderRadius: 6,
+  color: "#f2b8bb",
+  font: "12px/1 ui-sans-serif, system-ui, sans-serif",
+  fontWeight: 600,
+  cursor: "pointer",
+};
+
+const bannerListStyle: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 3,
+  margin: 0,
+  padding: 0,
+  listStyle: "none",
+  maxHeight: 132,
+  overflow: "auto",
+};
+
+const bannerRowStyle: CSSProperties = {
+  display: "flex",
+  alignItems: "baseline",
+  gap: 8,
+  overflow: "hidden",
+  whiteSpace: "nowrap",
+  textOverflow: "ellipsis",
+  fontSize: 12,
+};
+
+const bannerPauseStyle: CSSProperties = { color: "#e5484d", flex: "0 0 auto" };
+
+const bannerRepoStyle: CSSProperties = {
+  color: "#d7dae0",
+  fontWeight: 600,
+  flex: "0 0 auto",
+};
+
+const bannerRuleStyle: CSSProperties = { color: MUTED, flex: "0 0 auto" };
+
+const bannerCommandStyle: CSSProperties = {
+  color: FAINT,
+  font: "11px/1.4 ui-monospace, monospace",
+  overflow: "hidden",
+  whiteSpace: "nowrap",
+  textOverflow: "ellipsis",
+  minWidth: 0,
 };
 
 // --- grid + groups ---

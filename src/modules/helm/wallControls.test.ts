@@ -302,9 +302,20 @@ describe("mapHelmWallKey — `f` / `g` / `r` / esc", () => {
     expect(mapHelmWallKey({ key: "x" }, base)).toEqual({ kind: "answer-deny" });
   });
 
+  it("maps `A`/`X` (shift) to the bulk banner's Allow-all/Deny-all (task #19)", () => {
+    // Uppercase (shift) is the bulk pair; lowercase stays per-card. Shift is
+    // not treated as a chord, so `A`/`X` map through with no modifier.
+    expect(mapHelmWallKey({ key: "A" }, base)).toEqual({
+      kind: "bulk-allow-all",
+    });
+    expect(mapHelmWallKey({ key: "X" }, base)).toEqual({
+      kind: "bulk-deny-all",
+    });
+  });
+
   it("yields while a field is focused (letters must type)", () => {
     const ctx = { ...base, editing: true };
-    for (const key of ["f", "g", "r", "a", "x", "Escape"]) {
+    for (const key of ["f", "g", "r", "a", "x", "A", "X", "Escape"]) {
       expect(mapHelmWallKey({ key }, ctx)).toEqual({ kind: "none" });
     }
   });
@@ -314,6 +325,8 @@ describe("mapHelmWallKey — `f` / `g` / `r` / esc", () => {
     expect(mapHelmWallKey({ key: "f" }, ctx)).toEqual({ kind: "none" });
     expect(mapHelmWallKey({ key: "a" }, ctx)).toEqual({ kind: "none" });
     expect(mapHelmWallKey({ key: "x" }, ctx)).toEqual({ kind: "none" });
+    expect(mapHelmWallKey({ key: "A" }, ctx)).toEqual({ kind: "none" });
+    expect(mapHelmWallKey({ key: "X" }, ctx)).toEqual({ kind: "none" });
     expect(mapHelmWallKey({ key: "Escape" }, ctx)).toEqual({ kind: "none" });
   });
 
@@ -330,9 +343,16 @@ describe("mapHelmWallKey — `f` / `g` / `r` / esc", () => {
     expect(mapHelmWallKey({ key: "x", ctrlKey: true }, base)).toEqual({
       kind: "none",
     });
+    // The bulk pair yields to a modified chord too (⌘A selects all, etc.).
+    expect(mapHelmWallKey({ key: "A", metaKey: true }, base)).toEqual({
+      kind: "none",
+    });
+    expect(mapHelmWallKey({ key: "X", ctrlKey: true }, base)).toEqual({
+      kind: "none",
+    });
   });
 
-  it("while the picker is open, `r`/esc close it and f/g/a/x are inert", () => {
+  it("while the picker is open, `r`/esc close it and f/g/a/x/A/X are inert", () => {
     const ctx = { ...base, pickerOpen: true };
     expect(mapHelmWallKey({ key: "r" }, ctx)).toEqual({
       kind: "close-repo-picker",
@@ -344,5 +364,7 @@ describe("mapHelmWallKey — `f` / `g` / `r` / esc", () => {
     expect(mapHelmWallKey({ key: "g" }, ctx)).toEqual({ kind: "none" });
     expect(mapHelmWallKey({ key: "a" }, ctx)).toEqual({ kind: "none" });
     expect(mapHelmWallKey({ key: "x" }, ctx)).toEqual({ kind: "none" });
+    expect(mapHelmWallKey({ key: "A" }, ctx)).toEqual({ kind: "none" });
+    expect(mapHelmWallKey({ key: "X" }, ctx)).toEqual({ kind: "none" });
   });
 });

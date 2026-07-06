@@ -517,6 +517,15 @@ describe("approval answering seam", () => {
       }),
     ).resolves.toEqual({ status: "mismatch", reason: "dialogNotVisible" });
   });
+
+  it("recordBulkDecision logs a bulk banner action distinctly per Workspace", async () => {
+    const { invoke, calls } = fakeInvoke({ helm_record_bulk_decision: 2 });
+    const api = createHelmApi(invoke);
+    await expect(api.recordBulkDecision("ws-a", "allowAll")).resolves.toBe(2);
+    expect(calls).toEqual([
+      ["helm_record_bulk_decision", { workspaceId: "ws-a", action: "allowAll" }],
+    ]);
+  });
 });
 
 // Mirrors the pure-core derivation (core::cut::derive_status) for list

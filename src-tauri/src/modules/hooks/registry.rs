@@ -65,6 +65,18 @@ impl EndpointRegistry {
         self.get(workspace_id).map(|e| e.snapshot())
     }
 
+    /// Log a bulk banner decision (task #19) distinctly on the Workspace's
+    /// endpoint. Returns how many records were appended, or `None` when the
+    /// Workspace has no live endpoint (nothing to log against).
+    pub fn record_bulk_decision(
+        &self,
+        workspace_id: &str,
+        decision: crate::modules::core::control_plane::CardDecision,
+    ) -> Option<usize> {
+        self.get(workspace_id)
+            .map(|e| e.record_bulk_decision(decision))
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ControlPlaneEndpoint>>> {
         self.endpoints
             .lock()
