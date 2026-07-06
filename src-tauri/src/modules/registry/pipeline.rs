@@ -1279,4 +1279,220 @@ mod tests {
             "helm/fix"
         ));
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // M2 scripted demo — the milestone "Done when", backend seam.
+    //
+    //   Two Projects × two agents, triaged and driven end-to-end,
+    //   keyboard-only — at the automatable backend seam.
+    //
+    // This is the backend half of the M2 demo. The frontend half — the
+    // agent-signal → rollup → wall filter/group/repo-picker view-model —
+    // lives in `src/modules/helm/m2Demo.test.ts`. Together they exercise the
+    // whole end-to-end path; run this with `cargo test m2_demo`.
+    //
+    // COVERED here (automated): the real project → cut-pipeline → runtime →
+    // rollup path —
+    //   • two real git Projects added to the registry;
+    //   • two Workspaces cut through the full ambient pipeline, each
+    //     launching a *fake* agent on a real LocalPty (never a real
+    //     unattended `claude` — the fake prints its prompt then blocks);
+    //   • a zoom attach + a steer (write-to-PTY) through the runtime;
+    //   • status observed via the agent-signal → event → rollup path
+    //     (`session_status_from_signal` → `roll_up_status`).
+    //
+    // NOT covered here (human/verify at the running Tauri app, per the
+    // no-DOM-test constraint): the literal `f`/`g`/`r` key presses and the
+    // wall re-render. See the TS demo for the view-model assertions and the
+    // task journal for the human checklist.
+    #[test]
+    fn m2_demo_two_projects_two_agents_driven_end_to_end() {
+        use crate::modules::core::cut::{
+            roll_up_status, session_status_from_signal, SessionSignal,
+        };
+
+        // Drain output until `needle` shows up or the deadline passes;
+        // panics with the transcript on timeout (mirrors the conformance
+        // suite's `wait_for`).
+        fn wait_until(rx: &std::sync::mpsc::Receiver<Vec<u8>>, needle: &str) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut seen = Vec::new();
+            while !String::from_utf8_lossy(&seen).contains(needle) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok(chunk) => seen.extend_from_slice(&chunk),
+                    Err(_) => panic!(
+                        "never saw {needle:?}; transcript so far: {:?}",
+                        String::from_utf8_lossy(&seen)
+                    ),
+                }
+            }
+        }
+
+        // --- two Projects, both real git repos ---
+        // Project A comes from the standard fixture (repo on `main`).
+        let f = fixture();
+
+        // Project B: a second real repo on `trunk`, with its own worktree
+        // home, so the wall genuinely spans two Projects with two base
+        // branches.
+        let repo2 = f._tmp.path().join("repo2");
+        std::fs::create_dir_all(&repo2).unwrap();
+        git(&repo2, &["init", "-b", "trunk", "."]);
+        git(
+            &repo2,
+            &[
+                "-c", "user.name=t", "-c", "user.email=t@t", "commit",
+                "--allow-empty", "-m", "base",
+            ],
+        );
+        let repo2_root =
+            crate::modules::fs::to_canon(std::fs::canonicalize(&repo2).unwrap());
+        let wt2 = crate::modules::fs::to_canon(f._tmp.path().join("wt2"));
+        f.registry
+            .commit(Event::ProjectAdded {
+                project: Project {
+                    id: "prj-2".to_string(),
+                    name: "beta".to_string(),
+                    repo_root: repo2_root,
+                    base_branch: "trunk".to_string(),
+                    worktree_home: wt2,
+                    branch_template: "helm/{slug}".to_string(),
+                    settings: Default::default(),
+                },
+            })
+            .unwrap();
+
+        // --- a fake agent: prints its opening prompt, then echoes one line
+        //     steered in from the PTY (so attach + write are observable) ---
+        let script = f._tmp.path().join("steer-agent.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'OPENED[%s]\\n' \"$1\"\nread line\nprintf 'STEER[%s]\\n' \"$line\"\nsleep 30\n",
+        )
+        .unwrap();
+        let script = script.to_string_lossy().into_owned();
+
+        struct SteerHarness {
+            script: String,
+        }
+        impl Harness for SteerHarness {
+            fn id(&self) -> &'static str {
+                "fake-agent"
+            }
+            fn display_name(&self) -> &'static str {
+                "Steer"
+            }
+            fn caps(&self) -> Caps {
+                ClaudeCode.caps()
+            }
+            fn launch_plan(&self, ctx: &LaunchContext) -> LaunchPlan {
+                LaunchPlan {
+                    program: "/bin/sh".to_string(),
+                    args: vec![self.script.clone(), ctx.opening_prompt.to_string()],
+                }
+            }
+            fn config_injection(&self, _ctx: &LaunchContext) -> Vec<ConfigFile> {
+                Vec::new()
+            }
+        }
+        let harness = SteerHarness { script };
+        let runtime = LocalPty::default();
+
+        // --- cut one Workspace in each Project (the two agents) ---
+        let enq_a =
+            enqueue(&f.registry, &request("triage-login", "fix login")).unwrap();
+        run(&f.registry, &f.roots, &runtime, &harness, &enq_a);
+
+        let req_b = CutRequest {
+            project_id: "prj-2".to_string(),
+            slug: "triage-signup".to_string(),
+            profile_id: "prj-2:feature".to_string(),
+            brief: "add signup".to_string(),
+            fetch: false,
+        };
+        let enq_b = enqueue(&f.registry, &req_b).unwrap();
+        run(&f.registry, &f.roots, &runtime, &harness, &enq_b);
+
+        // Both cuts completed: the wall would show two Projects × two agents.
+        let state = f.registry.snapshot().unwrap();
+        assert_eq!(state.projects.len(), 2, "two Projects");
+        assert_eq!(state.workspaces.len(), 2, "two agents (Workspaces)");
+        let ws_a = state
+            .workspaces
+            .iter()
+            .find(|w| w.slug == "triage-login")
+            .unwrap();
+        let ws_b = state
+            .workspaces
+            .iter()
+            .find(|w| w.slug == "triage-signup")
+            .unwrap();
+        assert_ne!(ws_a.project_id, ws_b.project_id, "one agent per Project");
+        // A completed cut with no live Session yet derives as Idle.
+        assert_eq!(derive_status(ws_a), WorkspaceStatus::Idle);
+        assert_eq!(derive_status(ws_b), WorkspaceStatus::Idle);
+        let CutState::Complete {
+            first_session_id: sid_a,
+        } = ws_a.cut.clone()
+        else {
+            panic!("workspace A cut must complete, got {:?}", ws_a.cut);
+        };
+        let CutState::Complete {
+            first_session_id: sid_b,
+        } = ws_b.cut.clone()
+        else {
+            panic!("workspace B cut must complete, got {:?}", ws_b.cut);
+        };
+
+        // --- zoom attach + steer on agent A's real PTY session ---
+        let (tx, rx) = channel::<Vec<u8>>();
+        runtime
+            .attach(
+                &sid_a,
+                OutputSink {
+                    on_output: Box::new(move |b| {
+                        let _ = tx.send(b.to_vec());
+                    }),
+                    on_exit: Box::new(|_| {}),
+                },
+            )
+            .unwrap();
+        // Scrollback replays the opening prompt (Profile snippet + Brief).
+        wait_until(&rx, "OPENED[/tdd fix login]");
+        // Take the wheel: write a steer line straight to the PTY; the fake
+        // agent echoes it back, proving the steer reached the process.
+        runtime.write(&sid_a, b"take a different approach\r").unwrap();
+        wait_until(&rx, "STEER[take a different approach]");
+
+        // --- status via the agent-signal → event → rollup path ---
+        // Triage: agent A asks for approval (Attention → Blocked = "Needs
+        // you"); agent B is actively Working. This is the exact reducer the
+        // frontend mirrors (`viewModel.rollUpStatus`).
+        let a_status = roll_up_status(
+            derive_status(ws_a),
+            &[session_status_from_signal(SessionSignal::Attention).unwrap()],
+        );
+        assert_eq!(a_status, WorkspaceStatus::Blocked, "A asks → Needs you");
+        let b_status = roll_up_status(
+            derive_status(ws_b),
+            &[session_status_from_signal(SessionSignal::Working).unwrap()],
+        );
+        assert_eq!(b_status, WorkspaceStatus::Working, "B works");
+        // Driven to done: approve A, it finishes → To review.
+        assert_eq!(
+            roll_up_status(
+                derive_status(ws_a),
+                &[session_status_from_signal(SessionSignal::Finished).unwrap()],
+            ),
+            WorkspaceStatus::Done,
+        );
+        // An exited Session contributes nothing → the cut-derived Idle stands
+        // (no stale dot pinned by a dead process).
+        assert_eq!(session_status_from_signal(SessionSignal::Exited), None);
+
+        // --- never leave a live unattended agent behind ---
+        runtime.kill(&sid_a).ok();
+        runtime.kill(&sid_b).ok();
+    }
 }

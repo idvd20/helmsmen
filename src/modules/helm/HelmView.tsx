@@ -42,9 +42,13 @@ export interface HelmViewProps {
   /** Zoom to a Session. Defaults to a logging placeholder; #12 wires the
    * real zoom view through this prop. */
   onZoomSession?: (sessionId: string) => void;
+  /** False while an overlay (Zoom / New Workspace) owns the keyboard, so
+   * the wall's `f`/`g`/`r` keys yield. The container (#12/#9) drives it;
+   * the standalone mount leaves it true. */
+  keyboardActive?: boolean;
 }
 
-export function HelmView({ onZoomSession }: HelmViewProps) {
+export function HelmView({ onZoomSession, keyboardActive = true }: HelmViewProps) {
   const api = useMemo(() => createHelmApi(invoke), []);
   const [projects, setProjects] = useState<HelmProject[]>([]);
   const [profiles, setProfiles] = useState<HelmProfile[]>([]);
@@ -174,7 +178,14 @@ export function HelmView({ onZoomSession }: HelmViewProps) {
     [projects, workspaces, profiles, liveFacts, nowMs],
   );
 
-  return <Helm wall={wall} onZoomSession={onZoomSession} />;
+  return (
+    <Helm
+      wall={wall}
+      projects={projects}
+      keyboardActive={keyboardActive}
+      onZoomSession={onZoomSession}
+    />
+  );
 }
 
 // --- interim overlay mount (dev console entry) ---
