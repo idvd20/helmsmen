@@ -176,15 +176,58 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A line is dialog chrome — the prompt/options/footer that sit BELOW the
-/// command in a Claude Code permission dialog (the prompt/options/footer that
-/// sit BELOW the command block). Used to bound the command region: the intended
-/// command must be a row above this chrome, not a stray line elsewhere. Matched
-/// case-insensitively (layout copy). `requires confirmation` is the hook-forced
-/// dialog's first chrome line on a live CC 2.1.x screen (verified against a real
-/// `claude`), above the `Do you want to proceed?` / `1. Yes` / footer rows.
-fn is_chrome_line(line_lower: &str) -> bool {
-    DIALOG_MARKERS.iter().any(|m| line_lower.contains(m)) || line_lower.contains("requires confirmation")
+/// Rank of the hook-confirmation header (`Hook … requires confirmation …`) —
+/// the TOP chrome line of a hook-forced dialog, directly below the command box
+/// (and the description line) on a live CC 2.1.x screen.
+const RANK_CONFIRMATION: u8 = 0;
+/// Rank of the `Do you want to proceed?` question. The free-text hook REASON
+/// renders between [`RANK_CONFIRMATION`] and this line (verified live), which
+/// is the ONE place non-chrome text legally sits inside the chrome stack.
+const RANK_PROCEED: u8 = 1;
+
+/// Classify a (lowercased, whitespace-collapsed) visible line as dialog chrome
+/// and return WHERE it sits within ONE dialog's vertical layout — top (0) to
+/// bottom (4), calibrated against a live CC 2.1.x dialog: the hook-confirmation
+/// header, the proceed question, option 1, option 2, the key-hint footer.
+///
+/// The rank order is what anchors the match to the ACTIVE dialog on a
+/// partially repainted screen: walking UP from the bottom-most chrome line,
+/// ranks strictly decrease within a single dialog, so a repeated or increasing
+/// rank can only be a STALE dialog's chrome left above by a repaint.
+///
+/// Classification is by line PREFIX (after an optional selection caret), not
+/// substring, so a command whose text merely *contains* marker copy (e.g.
+/// `echo '1. Yes'`) is a command line, not chrome — a substring test would
+/// truncate the command box and make that command unapprovable. The
+/// confirmation header is the exception: CC renders it as
+/// `Hook <event>:<Tool> requires confirmation …`, so it is keyed on the `hook`
+/// prefix plus the phrase. These are the FRAGILE, layout-coupled markers of the
+/// seam, re-verified live per Claude Code release; drift fails *safe*
+/// ([`Mismatch::DialogNotVisible`], never a mis-injection).
+fn chrome_rank(line_lower: &str) -> Option<u8> {
+    // The highlighted option may carry a selection caret — strip it before the
+    // prefix tests.
+    let line = line_lower
+        .strip_prefix('\u{276f}') // ❯
+        .map(str::trim_start)
+        .unwrap_or(line_lower);
+    if line.starts_with("hook") && line.contains("requires confirmation") {
+        return Some(RANK_CONFIRMATION);
+    }
+    if line.starts_with("do you want to proceed") {
+        return Some(RANK_PROCEED);
+    }
+    if line.starts_with("1. yes") {
+        return Some(2);
+    }
+    if line.starts_with("2. no") || line.starts_with("no, and tell claude") {
+        return Some(3);
+    }
+    // Footer key hints; `tab to amend` also catches a soft-wrapped footer tail.
+    if line.starts_with("esc to cancel") || line.starts_with("tab to amend") {
+        return Some(4);
+    }
+    None
 }
 
 /// Command wrappers that are transparent proxies: they run the wrapped command
@@ -216,35 +259,114 @@ fn command_matches(candidate: &str, want: &str) -> bool {
     }
 }
 
-/// Is `want` the command of the dialog currently on screen? True iff some run
-/// of consecutive non-blank visible lines ABOVE the dialog's chrome collapses
-/// to EXACTLY `want` (case-sensitive), or to a transparent wrapper applied to
-/// `want` ([`command_matches`]). Exact equality defeats the
-/// substring/prefix hazard — a card command that is only a prefix of a longer,
-/// more dangerous live command ("git push" vs the on-screen "git push --force
-/// origin main") never matches. The multi-line run tolerates a soft-wrapped
-/// command; restricting to the region above the chrome keeps the match anchored
-/// to the dialog's command block and tolerates the description line CC renders
-/// between the command and the prompt (verified live). The snapshot is the
-/// current visible screen, so history/queued-underneath commands are not
-/// present. Any layout that yields no exact-line match → DialogNotVisible (fail
-/// safe, never a mis-injection).
-fn command_is_on_screen(lines: &[String], want: &str) -> bool {
-    // The command sits above the prompt/options; everything from the first
-    // chrome line down is dialog furniture, not the command.
-    let region_end = lines
-        .iter()
-        .position(|line| is_chrome_line(&line.to_lowercase()))
-        .unwrap_or(lines.len());
-    for start in 0..region_end {
-        if lines[start].is_empty() {
-            continue;
+/// Locate the ACTIVE dialog's command box: the range of the contiguous
+/// non-blank block of visible lines sitting directly above the active
+/// (bottom-most) dialog's TOP chrome line. `None` when no chrome — or nothing
+/// above it — is recognizable (fail safe).
+///
+/// The injected keystroke always lands on the ACTIVE dialog, so the command
+/// match must be bounded to THAT dialog's own command box. A repaint without a
+/// screen clear can leave an OLDER dialog, or plain output echoing a command,
+/// visible ABOVE the active one on the same snapshot — matching anywhere up
+/// there would approve a command the user never saw (story 30).
+///
+/// The walk starts at the bottom-most chrome line and climbs while
+/// [`chrome_rank`]s strictly DECREASE — the signature of one dialog read
+/// bottom-up. Blank rows are furniture. The one non-chrome text that legally
+/// sits inside the chrome stack is the free-text hook REASON between the
+/// proceed question and the confirmation header (verified live), so a
+/// non-chrome gap is crossed ONLY from the question ([`RANK_PROCEED`]) and
+/// ONLY to adopt a confirmation header ([`RANK_CONFIRMATION`]) above it. Any
+/// other shape ends the dialog: a repeated/increasing rank is a stale dialog's
+/// chrome, and any other non-chrome row is where the command box begins.
+///
+/// Residual assumption, documented: helmsmen only answers cards its own hook
+/// paused, and that hook always forces a dialog WITH the confirmation header.
+/// A screen where the active dialog lacks that header while a stale header —
+/// plus its command box — survives directly above the active question line is
+/// therefore not a reachable answer target; the reason-gap crossing prefers
+/// the hook-forced reading of that shape.
+fn active_command_box(lines: &[String]) -> Option<std::ops::Range<usize>> {
+    let lower: Vec<String> = lines.iter().map(|line| line.to_lowercase()).collect();
+    let bottom = lower.iter().rposition(|line| chrome_rank(line).is_some())?;
+    let mut top = bottom;
+    let mut top_rank = chrome_rank(&lower[bottom]).expect("bottom is a chrome line");
+    let mut i = bottom;
+    'walk: while i > 0 {
+        i -= 1;
+        if lower[i].is_empty() {
+            continue; // blank rows are dialog furniture
         }
-        let mut run: Vec<&str> = Vec::new();
-        for line in &lines[start..region_end] {
-            if line.is_empty() {
-                break; // a command is contiguous — don't span a blank row
+        match chrome_rank(&lower[i]) {
+            Some(rank) if rank < top_rank => {
+                top = i;
+                top_rank = rank;
             }
+            // A repeated or increasing rank is another (stale) dialog's chrome.
+            Some(_) => break,
+            // A non-chrome row below the proceed question may be the hook
+            // reason: cross it iff a confirmation header sits directly above.
+            None if top_rank == RANK_PROCEED => {
+                let mut j = i;
+                loop {
+                    if j == 0 {
+                        break 'walk; // screen top: the gap was the command box
+                    }
+                    j -= 1;
+                    if lower[j].is_empty() {
+                        continue;
+                    }
+                    match chrome_rank(&lower[j]) {
+                        Some(RANK_CONFIRMATION) => {
+                            top = j;
+                            top_rank = RANK_CONFIRMATION;
+                            i = j;
+                            break;
+                        }
+                        // Any other chrome above the gap: the gap was the
+                        // command box, not a reason.
+                        Some(_) => break 'walk,
+                        None => {} // still inside the (multi-line) gap
+                    }
+                }
+            }
+            // Above the dialog's top chrome line: the command box starts here.
+            None => break,
+        }
+    }
+    // The command box is the contiguous non-blank block directly above the
+    // top chrome line (blank rows between box and chrome are tolerated; the
+    // box may end with the description line CC renders under the command).
+    let mut end = top;
+    while end > 0 && lines[end - 1].is_empty() {
+        end -= 1;
+    }
+    let mut begin = end;
+    while begin > 0 && !lines[begin - 1].is_empty() {
+        begin -= 1;
+    }
+    (begin < end).then_some(begin..end)
+}
+
+/// Is `want` the command of the ACTIVE dialog currently on screen? True iff
+/// some run of consecutive visible lines WITHIN the active dialog's own
+/// command box ([`active_command_box`]) collapses to EXACTLY `want`
+/// (case-sensitive), or to a transparent wrapper applied to `want`
+/// ([`command_matches`]). Exact equality defeats the substring/prefix hazard —
+/// a card command that is only a prefix of a longer, more dangerous live
+/// command ("git push" vs the on-screen "git push --force origin main") never
+/// matches. The multi-line run tolerates a soft-wrapped command; bounding the
+/// search to the active dialog's command box keeps a stale dialog or echoed
+/// output higher on a partially repainted screen from verifying a card the
+/// keystroke would not answer. Any layout that yields no exact-line match →
+/// DialogNotVisible (fail safe, never a mis-injection).
+fn command_is_on_screen(lines: &[String], want: &str) -> bool {
+    let Some(command_box) = active_command_box(lines) else {
+        return false;
+    };
+    for start in command_box.clone() {
+        let mut run: Vec<&str> = Vec::new();
+        for line in &lines[start..command_box.end] {
             run.push(line);
             if command_matches(&collapse_ws(&run.join(" ")), want) {
                 return true;
@@ -263,20 +385,21 @@ fn command_is_on_screen(lines: &[String], want: &str) -> bool {
 pub(crate) fn debug_dump_screen(snapshot: &[u8], want: &str) -> String {
     use std::fmt::Write as _;
     let lines = visible_lines(snapshot);
-    let region_end = lines
-        .iter()
-        .position(|line| is_chrome_line(&line.to_lowercase()))
-        .unwrap_or(lines.len());
+    let command_box = active_command_box(&lines);
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "\n=== visible screen: {} lines, chrome boundary at {} (command searched in lines 0..{}) ===",
+        "\n=== visible screen: {} lines, active command box = {:?} ===",
         lines.len(),
-        region_end,
-        region_end
+        command_box
     );
     for (i, line) in lines.iter().enumerate() {
-        let flag = if i == region_end { " <== first chrome line" } else { "" };
+        let rank = chrome_rank(&line.to_lowercase());
+        let flag = match (&command_box, rank) {
+            (_, Some(rank)) => format!(" <== chrome (rank {rank})"),
+            (Some(range), None) if range.contains(&i) => " <== command box".to_string(),
+            _ => String::new(),
+        };
         let _ = writeln!(out, "{i:>3} | {line:?}{flag}");
     }
     let _ = writeln!(
@@ -294,8 +417,10 @@ pub(crate) fn debug_dump_screen(snapshot: &[u8], want: &str) -> String {
 /// Command matching is case-SENSITIVE and EXACT (tightest form of the security
 /// check — never resume a differently-cased command, and never resume a
 /// command that only *contains* the card's command as a substring/prefix); it
-/// is anchored to the dialog's own command row(s), not matched anywhere in the
-/// screen. The one tolerated divergence is a leading transparent-wrapper token
+/// is anchored to the ACTIVE (bottom-most) dialog's own command row(s) — the
+/// dialog the injected keystroke actually answers — not matched anywhere in
+/// the screen, so a stale dialog or echoed output left above by a partial
+/// repaint never verifies. The one tolerated divergence is a leading transparent-wrapper token
 /// ([`TRANSPARENT_WRAPPERS`], e.g. `rtk`) a user-level hook prepended after the
 /// card was recorded — the remainder must still equal the card command exactly. Dialog-presence markers are matched case-insensitively (layout copy,
 /// not identity). The snapshot passed here is the CURRENT visible screen (the
@@ -483,14 +608,13 @@ mod tests {
         assert_eq!(err, Mismatch::DialogNotVisible, "a substring is not the same command");
     }
 
-    /// The real CC 2.1.x hook-forced dialog (captured live): the command is
-    /// followed by a human DESCRIPTION line and the multi-line hook reason
-    /// before the prompt — the command is not immediately adjacent to the
-    /// chrome. The match must still find it (anchored to the region above the
-    /// chrome), and must still reject a mere prefix.
-    fn live_layout_screen(command: &str) -> Vec<u8> {
+    /// One real CC 2.1.x hook-forced dialog (captured live), WITHOUT a leading
+    /// screen clear: the command is followed by a human DESCRIPTION line and
+    /// the hook reason before the prompt — the command is not immediately
+    /// adjacent to the chrome.
+    fn live_dialog_frame(command: &str) -> String {
         format!(
-            "\x1b[2J\x1b[H Bash command\r\n\r\n  \x1b[36m{command}\x1b[0m\r\n  \
+            " Bash command\r\n\r\n  \x1b[36m{command}\x1b[0m\r\n  \
              Amend the last commit keeping the same message\r\n\r\n \
              Hook PreToolUse:Bash requires confirmation for this command:\r\n \
              Helmsmen: git history rewrite \u{2014} approval required\r\n\r\n \
@@ -498,7 +622,13 @@ mod tests {
              Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain",
             command = command
         )
-        .into_bytes()
+    }
+
+    /// The real CC 2.1.x hook-forced dialog (captured live) on a cleanly
+    /// repainted screen. The match must still find the command (anchored to
+    /// the dialog's own command box), and must still reject a mere prefix.
+    fn live_layout_screen(command: &str) -> Vec<u8> {
+        format!("\x1b[2J\x1b[H{}", live_dialog_frame(command)).into_bytes()
     }
 
     #[test]
@@ -566,6 +696,85 @@ mod tests {
         let screen = dialog_screen("RM -RF BUILD");
         let err = allow(&screen, "rm -rf build").unwrap_err();
         assert_eq!(err, Mismatch::DialogNotVisible);
+    }
+
+    // --- partial repaint: the match must be bounded to the ACTIVE dialog
+    // (story 30). A repaint without a screen clear (no ESC[2J) can leave an
+    // OLDER dialog — or plain output echoing a command — visible ABOVE the
+    // active one on the same screen. The injected `1` always lands on the
+    // ACTIVE (bottom-most) dialog, so a match anywhere higher would approve a
+    // command the user never saw. ---
+
+    /// A PARTIALLY repainted screen: dialog A (stale, already superseded) is
+    /// still fully visible near the top — no ESC[2J was issued — and the
+    /// ACTIVE dialog B was painted below it. Both use the live-captured
+    /// layout, so two commands coexist above one shared bottom edge.
+    fn partially_repainted_screen(stale: &str, active: &str) -> Vec<u8> {
+        format!("{}\r\n{}", live_dialog_frame(stale), live_dialog_frame(active)).into_bytes()
+    }
+
+    #[test]
+    fn a_stale_dialog_above_the_active_one_cannot_verify_its_card() {
+        // The user answers the EARLIER card (A). Its exact command is still on
+        // screen — but only in the stale top dialog; the keystroke would land
+        // on the ACTIVE bottom dialog (B). Must refuse, never inject.
+        let screen =
+            partially_repainted_screen("git push --force origin main", "git rebase -i HEAD~5");
+        let err = allow(&screen, "git push --force origin main").unwrap_err();
+        assert_eq!(
+            err,
+            Mismatch::DialogNotVisible,
+            "a stale dialog's command above the active one must not verify"
+        );
+    }
+
+    #[test]
+    fn the_active_bottom_dialog_still_verifies_on_a_partially_repainted_screen() {
+        // Same screen: the card for the ACTIVE (bottom-most) dialog is the one
+        // the keystroke actually answers — it must verify.
+        let screen =
+            partially_repainted_screen("git push --force origin main", "git rebase -i HEAD~5");
+        let steps = allow(&screen, "git rebase -i HEAD~5").unwrap();
+        assert_eq!(steps, vec![KeyStep::Inject(b"1".to_vec())]);
+    }
+
+    #[test]
+    fn a_command_echoed_in_output_above_the_active_dialog_cannot_verify() {
+        // Agent output above the dialog echoes card A's exact command as a
+        // plain line (partial repaint, no clear). The active dialog below is
+        // for a DIFFERENT command. Answering card A must refuse.
+        let screen = "$ tail of ordinary agent output\r\n\
+             git push --force origin main\r\n\r\n\
+             Bash command\r\n  \x1b[36mgit rebase -i HEAD~5\x1b[0m\r\n\r\n\
+             Hook PreToolUse:Bash requires confirmation\r\n\
+             \x1b[7m 1. Yes \x1b[0m\r\n 2. No, and tell Claude what to do differently\r\n\
+             Esc to cancel \u{b7} Tab to amend"
+            .as_bytes()
+            .to_vec();
+        let err = allow(&screen, "git push --force origin main").unwrap_err();
+        assert_eq!(
+            err,
+            Mismatch::DialogNotVisible,
+            "an echoed command outside the active dialog's command box must not verify"
+        );
+        // The active dialog's own card still verifies on the same screen.
+        let steps = allow(&screen, "git rebase -i HEAD~5").unwrap();
+        assert_eq!(steps, vec![KeyStep::Inject(b"1".to_vec())]);
+    }
+
+    // --- chrome classification: a command CONTAINING marker text is a
+    // command, not chrome. Misclassifying it truncates the command box so the
+    // command can never be approved from the wall (fails safe, but wrongly). ---
+
+    #[test]
+    fn a_command_containing_chrome_marker_text_is_still_approvable() {
+        let screen = dialog_screen("echo '1. Yes'");
+        let steps = allow(&screen, "echo '1. Yes'").unwrap();
+        assert_eq!(steps, vec![KeyStep::Inject(b"1".to_vec())]);
+
+        let screen = dialog_screen("printf 'Esc to cancel \u{b7} Tab to amend'");
+        let steps = allow(&screen, "printf 'Esc to cancel \u{b7} Tab to amend'").unwrap();
+        assert_eq!(steps, vec![KeyStep::Inject(b"1".to_vec())]);
     }
 
     #[test]
