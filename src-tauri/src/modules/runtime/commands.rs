@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, Response};
 use tauri::State;
 
+use crate::modules::core::session::SessionKind;
 use crate::modules::registry::RegistryState;
 use crate::modules::workspace::WorkspaceRegistry;
 
-use super::spawn::prepare_spawn;
+use super::spawn::{prepare_process_spawn, prepare_shell_spawn, prepare_spawn};
 use super::{OutputSink, RuntimeState, SessionStatus, LOCAL_PTY};
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +92,143 @@ pub async fn helm_spawn_agent(
         runtime: runtime_kind,
         harness_id,
         workspace_id: input.workspace_id,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnShellInput {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+}
+
+/// The handle for a spawned Shell Session — the user's own terminal in the
+/// worktree. `kind` is always [`SessionKind::Shell`]; the frontend keys its
+/// chip/tab off it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellSessionInfo {
+    pub session_id: String,
+    pub runtime: String,
+    pub workspace_id: String,
+    pub kind: SessionKind,
+}
+
+/// Spawn a **Shell Session** in a cut Workspace: the user's own shell,
+/// running in the worktree with the cut's `HELMSMEN_*` env, on the named
+/// Runtime (LocalPty by default).
+#[tauri::command]
+pub async fn helm_spawn_shell(
+    registry: State<'_, RegistryState>,
+    roots: State<'_, WorkspaceRegistry>,
+    runtimes: State<'_, RuntimeState>,
+    input: SpawnShellInput,
+    on_data: Channel<Response>,
+    on_exit: Channel<i32>,
+) -> Result<ShellSessionInfo, String> {
+    let runtime_kind = input.runtime.as_deref().unwrap_or(LOCAL_PTY).to_string();
+    let runtime = runtimes.get(&runtime_kind)?;
+    let spec = prepare_shell_spawn(
+        &registry,
+        &roots,
+        &input.workspace_id,
+        input.cols.unwrap_or(120),
+        input.rows.unwrap_or(32),
+    )?;
+
+    let session_id = tauri::async_runtime::spawn_blocking(move || {
+        runtime.spawn(spec, channel_sink(on_data, on_exit))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    log::info!(
+        "shell session {session_id} spawned (workspace={}, runtime={runtime_kind})",
+        input.workspace_id
+    );
+    Ok(ShellSessionInfo {
+        session_id,
+        runtime: runtime_kind,
+        workspace_id: input.workspace_id,
+        kind: SessionKind::Shell,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnProcessInput {
+    pub workspace_id: String,
+    /// Name of one of the Project's Process definitions (`dev`, `db`).
+    pub process_name: String,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+}
+
+/// The handle for a spawned Process Session. Carries the Process's name and
+/// declared port so the frontend can render its chip (`dev:5173`) without
+/// parsing the (hostile) process output.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessSessionInfo {
+    pub session_id: String,
+    pub runtime: String,
+    pub workspace_id: String,
+    pub kind: SessionKind,
+    pub process_name: String,
+    pub port: Option<u16>,
+}
+
+/// Spawn a **Process Session** in a cut Workspace: one of the Project's
+/// Process definitions, resolved by name backend-side (the frontend names a
+/// definition, never a command), run in the worktree with the `HELMSMEN_*`
+/// env.
+#[tauri::command]
+pub async fn helm_spawn_process(
+    registry: State<'_, RegistryState>,
+    roots: State<'_, WorkspaceRegistry>,
+    runtimes: State<'_, RuntimeState>,
+    input: SpawnProcessInput,
+    on_data: Channel<Response>,
+    on_exit: Channel<i32>,
+) -> Result<ProcessSessionInfo, String> {
+    let runtime_kind = input.runtime.as_deref().unwrap_or(LOCAL_PTY).to_string();
+    let runtime = runtimes.get(&runtime_kind)?;
+    let (spec, def) = prepare_process_spawn(
+        &registry,
+        &roots,
+        &input.workspace_id,
+        &input.process_name,
+        input.cols.unwrap_or(120),
+        input.rows.unwrap_or(32),
+    )?;
+
+    let session_id = tauri::async_runtime::spawn_blocking(move || {
+        runtime.spawn(spec, channel_sink(on_data, on_exit))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    log::info!(
+        "process session {session_id} spawned (workspace={}, process={}, runtime={runtime_kind})",
+        input.workspace_id,
+        def.name
+    );
+    Ok(ProcessSessionInfo {
+        session_id,
+        runtime: runtime_kind,
+        workspace_id: input.workspace_id,
+        kind: SessionKind::Process,
+        process_name: def.name,
+        port: def.port,
     })
 }
 

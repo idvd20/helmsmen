@@ -12,11 +12,24 @@
 // Purely a shell over data + the invoke seam: it never spawns, gits, or
 // touches files, and all Session output stays inert text in PtyPane.
 
-import { type CSSProperties, useEffect, useRef, useState } from "react";
-import type { HelmApi } from "@/modules/helm/api";
+import {
+  type CSSProperties,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { HelmApi, HelmProcessDef } from "@/modules/helm/api";
 import { mapZoomKey } from "./keymap";
 import { PtyPane } from "./PtyPane";
-import { messageToPtyLine, type ZoomTarget } from "./zoomModel";
+import { sessionStore } from "./sessionStore";
+import {
+  groupSessions,
+  messageToPtyLine,
+  processDefLabel,
+  type ZoomSession,
+  type ZoomTarget,
+} from "./zoomModel";
 
 export interface ZoomProps {
   api: HelmApi;
@@ -31,7 +44,25 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
   const [activeIndex, setActiveIndex] = useState(target.activeIndex);
   const [messageOpen, setMessageOpen] = useState(false);
   const [messageText, setMessageText] = useState("");
+  const [liveSessions, setLiveSessions] = useState(() => sessionStore.list());
+  const [processes, setProcesses] = useState<HelmProcessDef[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Live Session set: a Session added or killed from the zoom appears /
+  // disappears here at once, so the tab bar tracks it without waiting on the
+  // container to re-derive the target.
+  useEffect(
+    () => sessionStore.subscribe(() => setLiveSessions(sessionStore.list())),
+    [],
+  );
+
+  // The active Workspace's Session tabs, live from the store (spawn order).
+  // Falls back to the container-supplied tabs before the first subscription
+  // fire so the initial render is never empty.
+  const tabs = useMemo<ZoomSession[]>(() => {
+    const grouped = groupSessions(liveSessions)[target.workspaceId];
+    return grouped && grouped.length > 0 ? grouped : target.tabs;
+  }, [liveSessions, target.workspaceId, target.tabs]);
 
   // A new target (a `[`/`]` hop or a fresh zoom) resets the active tab and
   // closes any open message box.
@@ -45,6 +76,29 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
     if (messageOpen) inputRef.current?.focus();
   }, [messageOpen]);
 
+  // The Project's Process definitions for the add-session menu. Resolved
+  // through the api (workspace -> project -> settings.processes); a raw
+  // command never crosses the seam — the spawn names a definition.
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const [workspaces, projects] = await Promise.all([
+          api.listWorkspaces(),
+          api.listProjects(),
+        ]);
+        const ws = workspaces.find((w) => w.id === target.workspaceId);
+        const project = projects.find((p) => p.id === ws?.projectId);
+        if (live) setProcesses(project?.settings.processes ?? []);
+      } catch {
+        // A transient invoke failure just leaves the last process list.
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [api, target.workspaceId]);
+
   // The single zoom keyboard listener. `editing` yields the whole keyboard
   // to the message box when it is open.
   useEffect(() => {
@@ -56,7 +110,7 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
           metaKey: ev.metaKey,
           altKey: ev.altKey,
         },
-        { tabCount: target.tabs.length, editing: messageOpen },
+        { tabCount: tabs.length, editing: messageOpen },
       );
       if (action.kind === "none") return;
       ev.preventDefault();
@@ -77,14 +131,51 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [target, messageOpen, onReturn, onHopWorkspace]);
+  }, [tabs.length, messageOpen, onReturn, onHopWorkspace]);
 
-  const active = target.tabs[activeIndex] ?? target.tabs[0];
+  // Clamp the active tab into the live set: killing a Session shrinks the
+  // tabs, so an out-of-range index falls back to the last remaining tab.
+  const safeIndex = Math.min(Math.max(activeIndex, 0), Math.max(tabs.length - 1, 0));
+  const active = tabs[safeIndex];
 
   const sendMessage = () => {
     if (!active) return;
     void api.writeAgent(active, messageToPtyLine(messageText)).catch(() => {});
     setMessageText("");
+  };
+
+  // Add-session controls. The backend spawns (shell / named Process) in the
+  // worktree with the `HELMSMEN_*` env; the returned handle is registered so
+  // it appears as a new tab here and a new chip on the wall. Focus the new
+  // tab: it is appended, so its index is the pre-add tab count.
+  const addShell = () => {
+    const nextIndex = tabs.length;
+    void api
+      .spawnShell(target.workspaceId)
+      .then((session) => {
+        sessionStore.register(session);
+        setActiveIndex(nextIndex);
+      })
+      .catch(() => {});
+  };
+
+  const addProcess = (name: string) => {
+    const nextIndex = tabs.length;
+    void api
+      .spawnProcess(target.workspaceId, name)
+      .then((session) => {
+        sessionStore.register(session);
+        setActiveIndex(nextIndex);
+      })
+      .catch(() => {});
+  };
+
+  // Kill a Session: terminate its process, then drop it from the registry so
+  // its tab and wall chip disappear and the status rollup recomputes over the
+  // remaining live Sessions.
+  const killSession = (session: ZoomSession) => {
+    void api.killAgent(session).catch(() => {});
+    sessionStore.unregister(session.sessionId);
   };
 
   const onInputKeyDown = (ev: React.KeyboardEvent<HTMLInputElement>) => {
@@ -112,18 +203,52 @@ export function Zoom({ api, target, onReturn, onHopWorkspace }: ZoomProps) {
       </header>
 
       <nav style={tabBarStyle} aria-label="sessions">
-        {target.tabs.map((tab, index) => (
-          <button
+        {tabs.map((tab, index) => (
+          <span
             key={tab.sessionId}
-            type="button"
-            aria-current={index === activeIndex}
-            style={index === activeIndex ? tabActiveStyle : tabStyle}
-            title={`session ${index + 1}`}
-            onClick={() => setActiveIndex(index)}
+            style={index === safeIndex ? tabActiveStyle : tabStyle}
           >
-            <span style={tabNumStyle}>{index + 1}</span> {tab.label}
-          </button>
+            <button
+              type="button"
+              aria-current={index === safeIndex}
+              style={tabSelectStyle}
+              title={`session ${index + 1}`}
+              onClick={() => setActiveIndex(index)}
+            >
+              <span style={tabNumStyle}>{index + 1}</span> {tab.label}
+            </button>
+            <button
+              type="button"
+              style={killStyle}
+              title={`kill ${tab.label}`}
+              aria-label={`kill ${tab.label}`}
+              onClick={() => killSession(tab)}
+            >
+              ×
+            </button>
+          </span>
         ))}
+        <span style={addBarStyle}>
+          <button
+            type="button"
+            style={addStyle}
+            title="add a shell session in this worktree"
+            onClick={addShell}
+          >
+            ＋ shell
+          </button>
+          {processes.map((def) => (
+            <button
+              key={def.name}
+              type="button"
+              style={addStyle}
+              title={`add the ${def.name} process in this worktree`}
+              onClick={() => addProcess(def.name)}
+            >
+              ＋ {processDefLabel(def)}
+            </button>
+          ))}
+        </span>
       </nav>
 
       {active ? (
@@ -211,14 +336,13 @@ const tabBarStyle: CSSProperties = {
 const tabStyle: CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
-  gap: 6,
-  padding: "3px 10px",
+  gap: 2,
+  padding: "1px 4px 1px 8px",
   background: "#141a26",
   border: "1px solid #2d3343",
   borderRadius: 999,
   color: "#d7dae0",
   font: "11px/1 ui-monospace, monospace",
-  cursor: "pointer",
 };
 
 const tabActiveStyle: CSSProperties = {
@@ -226,6 +350,48 @@ const tabActiveStyle: CSSProperties = {
   background: "#1e2636",
   borderColor: "#3b4a63",
   color: "#fff",
+};
+
+const tabSelectStyle: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  padding: "3px 2px",
+  background: "transparent",
+  border: "none",
+  color: "inherit",
+  font: "inherit",
+  cursor: "pointer",
+};
+
+const killStyle: CSSProperties = {
+  background: "transparent",
+  border: "none",
+  color: "#8b93a7",
+  cursor: "pointer",
+  font: "13px/1 ui-monospace, monospace",
+  padding: "2px 4px",
+};
+
+const addBarStyle: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  marginLeft: "auto",
+  flexWrap: "wrap",
+};
+
+const addStyle: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 4,
+  padding: "3px 10px",
+  background: "#0b1220",
+  border: "1px dashed #3b4a63",
+  borderRadius: 999,
+  color: "#8b93a7",
+  font: "11px/1 ui-monospace, monospace",
+  cursor: "pointer",
 };
 
 const tabNumStyle: CSSProperties = { color: "#8b93a7", fontWeight: 700 };

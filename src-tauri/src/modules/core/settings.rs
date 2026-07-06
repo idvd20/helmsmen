@@ -41,6 +41,13 @@ pub struct ProcessDef {
     pub name: String,
     /// Shell command line (user's shell, cwd = worktree).
     pub command: String,
+    /// Nominal port the Process serves on, shown in its Session chip
+    /// (`dev:5173`). Display data only: Helmsmen neither binds it nor parses
+    /// it from the (hostile) process output — a Process that serves nothing
+    /// leaves it unset. Additive with a default so pre-#13 registry files
+    /// keep loading.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 /// Validate settings as pure data. Called by `apply` so no invalid
@@ -142,6 +149,7 @@ mod tests {
         ProcessDef {
             name: name.to_string(),
             command: command.to_string(),
+            port: None,
         }
     }
 
@@ -291,5 +299,31 @@ mod tests {
     fn settings_json_without_any_field_deserializes_to_default() {
         let s: ProjectSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(s, ProjectSettings::default());
+    }
+
+    #[test]
+    fn process_port_is_optional_defaults_to_none_and_round_trips() {
+        // Pre-#13 registry files have no `port` key on a Process.
+        let old: ProcessDef =
+            serde_json::from_str(r#"{ "name": "dev", "command": "pnpm dev" }"#).unwrap();
+        assert_eq!(old.port, None);
+
+        // A declared port (the `dev:5173` chip) survives a round trip.
+        let declared = ProcessDef {
+            name: "dev".to_string(),
+            command: "pnpm dev".to_string(),
+            port: Some(5173),
+        };
+        let json = serde_json::to_value(&declared).unwrap();
+        assert_eq!(json["port"], 5173);
+        let back: ProcessDef = serde_json::from_value(json).unwrap();
+        assert_eq!(back, declared);
+
+        // A declared port is still valid data.
+        assert!(validate_settings(&ProjectSettings {
+            processes: vec![declared],
+            ..ProjectSettings::default()
+        })
+        .is_ok());
     }
 }

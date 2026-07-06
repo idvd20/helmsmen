@@ -6,7 +6,7 @@
 // hop. Deterministic over data — no clock, no DOM, no process — so the
 // zoom's navigation is CI-checked even though its React shell is not.
 
-import type { HelmAgentSession } from "@/modules/helm/api";
+import type { HelmProcessDef, HelmSession } from "@/modules/helm/api";
 import { hopWorkspaceIndex } from "./keymap";
 
 export type ZoomSessionKind = "agent" | "shell" | "process" | "reviewer";
@@ -39,21 +39,42 @@ export interface ZoomTarget {
 
 const HARNESS_TOKEN: Record<string, string> = { "claude-code": "claude" };
 
-/** Session tab label, e.g. `claude·local-pty` — mirrors the wall's chip
- * copy (`{harness}·{runtime}`). */
-export function sessionTabLabel(
-  session: Pick<HelmAgentSession, "harnessId" | "runtime">,
-): string {
-  const token = HARNESS_TOKEN[session.harnessId] ?? session.harnessId;
-  return `${token}·${session.runtime}`;
+/** Short harness token for a chip/tab, e.g. `claude-code` -> `claude`;
+ * unknown ids pass through. Shared with the wall's Session facts. */
+export function harnessToken(harnessId: string): string {
+  return HARNESS_TOKEN[harnessId] ?? harnessId;
 }
 
-/** Project a spawned Agent Session onto a zoom tab. */
-export function toZoomSession(session: HelmAgentSession): ZoomSession {
+/** The `{name}:{port}` / `{name}` label for a Process (Session tab or the
+ * add-session button), mirroring the wall's chip copy. */
+export function processLabel(name: string, port?: number): string {
+  return port != null ? `${name}:${port}` : name;
+}
+
+/** Add-session button label for one of the Project's Process definitions. */
+export function processDefLabel(def: HelmProcessDef): string {
+  return processLabel(def.name, def.port);
+}
+
+/** Session tab label per kind: `claude·local-pty` for an agent, `shell`,
+ * `dev:5173` for a Process — mirrors the wall's chip copy. */
+export function sessionTabLabel(session: HelmSession): string {
+  switch (session.kind) {
+    case "agent":
+      return `${harnessToken(session.harnessId ?? "agent")}·${session.runtime}`;
+    case "shell":
+      return "shell";
+    case "process":
+      return processLabel(session.processName ?? "process", session.port);
+  }
+}
+
+/** Project a spawned Session (any kind) onto a zoom tab. */
+export function toZoomSession(session: HelmSession): ZoomSession {
   return {
     sessionId: session.sessionId,
     runtime: session.runtime,
-    kind: "agent",
+    kind: session.kind,
     label: sessionTabLabel(session),
   };
 }
@@ -61,7 +82,7 @@ export function toZoomSession(session: HelmAgentSession): ZoomSession {
 /** Group Sessions by Workspace, preserving registration (spawn) order so
  * tab numbering `1…9` stays stable. */
 export function groupSessions(
-  sessions: HelmAgentSession[],
+  sessions: HelmSession[],
 ): Record<string, ZoomSession[]> {
   const grouped: Record<string, ZoomSession[]> = {};
   for (const session of sessions) {

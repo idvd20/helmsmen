@@ -279,6 +279,7 @@ mod tests {
             processes: vec![ProcessDef {
                 name: "dev".to_string(),
                 command: "pnpm dev".to_string(),
+                port: Some(5173),
             }],
         }
     }

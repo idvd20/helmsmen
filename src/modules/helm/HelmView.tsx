@@ -17,6 +17,10 @@ import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import {
+  mergeSessionFacts,
+  sessionStore,
+} from "@/modules/workspaces/sessionStore";
+import {
   applyLiveStatuses,
   type HelmAgentSignal,
   type LiveSessionStatuses,
@@ -47,6 +51,7 @@ export function HelmView({ onZoomSession }: HelmViewProps) {
   const [workspaces, setWorkspaces] = useState<HelmWorkspace[]>([]);
   const [facts, setFacts] = useState<Record<string, WorkspaceFacts>>({});
   const [liveStatuses, setLiveStatuses] = useState<LiveSessionStatuses>({});
+  const [sessions, setSessions] = useState(() => sessionStore.list());
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   // Projects and Profiles change rarely — load them once.
@@ -105,6 +110,22 @@ export function HelmView({ onZoomSession }: HelmViewProps) {
     return () => clearInterval(id);
   }, []);
 
+  // The interim live-Session registry (spawns from the zoom's add-session
+  // controls and the dev console). Folded into the Session facts below so a
+  // Session added or killed shows up / disappears as a card chip at once.
+  useEffect(
+    () => sessionStore.subscribe(() => setSessions(sessionStore.list())),
+    [],
+  );
+
+  // Fold the live Sessions onto the polled facts, keyed by Workspace, before
+  // the status overlay — this is the wire that makes added Sessions appear as
+  // the wall's Session chips.
+  const factsWithSessions = useMemo(
+    () => mergeSessionFacts(facts, sessions),
+    [facts, sessions],
+  );
+
   // Live status (task #11): ride Terax's OSC agent-signal. The signal is
   // data, never a command — the pure reducer folds it into a per-Session
   // status map, overlaid onto Session facts below. This is the M2 interim
@@ -131,22 +152,22 @@ export function HelmView({ onZoomSession }: HelmViewProps) {
   // only fills in each Session's live status, so the existing rollup lights
   // the dot with no card or rollup change.
   const liveFacts = useMemo<Record<string, WorkspaceFacts>>(() => {
-    if (Object.keys(liveStatuses).length === 0) return facts;
+    if (Object.keys(liveStatuses).length === 0) return factsWithSessions;
     let changed = false;
     const next: Record<string, WorkspaceFacts> = {};
-    for (const [id, f] of Object.entries(facts)) {
+    for (const [id, f] of Object.entries(factsWithSessions)) {
       if (f.sessions && f.sessions.length > 0) {
-        const sessions = applyLiveStatuses(f.sessions, liveStatuses);
-        if (sessions !== f.sessions) {
-          next[id] = { ...f, sessions };
+        const withStatus = applyLiveStatuses(f.sessions, liveStatuses);
+        if (withStatus !== f.sessions) {
+          next[id] = { ...f, sessions: withStatus };
           changed = true;
           continue;
         }
       }
       next[id] = f;
     }
-    return changed ? next : facts;
-  }, [facts, liveStatuses]);
+    return changed ? next : factsWithSessions;
+  }, [factsWithSessions, liveStatuses]);
 
   const wall = useMemo<WallView>(
     () => buildWall({ projects, workspaces, profiles, facts: liveFacts, nowMs }),

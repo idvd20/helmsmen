@@ -11,6 +11,9 @@
 export interface HelmProcessDef {
   name: string;
   command: string;
+  /** Nominal port the Process serves on, shown in its Session chip
+   * (`dev:5173`). Display data only — never parsed from process output. */
+  port?: number;
 }
 
 /** Per-Project settings, stored user-level in Helmsmen's registry only —
@@ -170,6 +173,48 @@ export interface HelmAgentSession {
   workspaceId: string;
 }
 
+/** The kinds of Session a Workspace hosts (Reviewer arrives with the
+ * approvals slice). Mirrors the backend `core::session::SessionKind`. */
+export type HelmSessionKind = "agent" | "shell" | "process";
+
+/** A spawned Session of any kind, as the interim registry holds it. Every
+ * kind shares the opaque handle (`sessionId` + `runtime`); the extra fields
+ * are the chip/tab facts for that kind (agent harness, process name/port).
+ * Structurally a superset of `HelmAgentSession`, so it satisfies the
+ * `Pick<HelmAgentSession, "sessionId" | "runtime">` session operations. */
+export interface HelmSession {
+  sessionId: string;
+  runtime: string;
+  workspaceId: string;
+  kind: HelmSessionKind;
+  /** Agent only — the Harness id (`claude-code`). */
+  harnessId?: string;
+  /** Process only — the Project Process definition's name (`dev`). */
+  processName?: string;
+  /** Process only — the declared port for the chip (`dev:5173`). */
+  port?: number;
+}
+
+/** Handle returned by spawning a Shell Session (`kind` is always
+ * `"shell"`). */
+export interface HelmShellSession {
+  sessionId: string;
+  runtime: string;
+  workspaceId: string;
+  kind: "shell";
+}
+
+/** Handle returned by spawning a Process Session, carrying the chip facts
+ * (`kind` is always `"process"`). */
+export interface HelmProcessSession {
+  sessionId: string;
+  runtime: string;
+  workspaceId: string;
+  kind: "process";
+  processName: string;
+  port?: number;
+}
+
 export type HelmSessionStatus =
   | { state: "running" }
   | { state: "exited"; code: number };
@@ -308,6 +353,40 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
       ...streamChannels(opts),
     });
 
+  /** Spawn a Shell Session — the user's own terminal in the Workspace's
+   * worktree, carrying the cut's `HELMSMEN_*` env. Streams like an Agent
+   * Session; the backend picks the user's shell. */
+  const spawnShell = (workspaceId: string, opts: SpawnAgentOptions = {}) =>
+    invoke<HelmShellSession>("helm_spawn_shell", {
+      input: {
+        workspaceId,
+        runtime: opts.runtime,
+        cols: opts.cols,
+        rows: opts.rows,
+      },
+      ...streamChannels(opts),
+    });
+
+  /** Spawn a Process Session from one of the Project's Process definitions
+   * (named, never a raw command): the backend resolves the definition and
+   * runs it in the worktree. Returns the chip facts (name + declared
+   * port). */
+  const spawnProcess = (
+    workspaceId: string,
+    processName: string,
+    opts: SpawnAgentOptions = {},
+  ) =>
+    invoke<HelmProcessSession>("helm_spawn_process", {
+      input: {
+        workspaceId,
+        processName,
+        runtime: opts.runtime,
+        cols: opts.cols,
+        rows: opts.rows,
+      },
+      ...streamChannels(opts),
+    });
+
   /** Re-point a session's stream at new handlers (webview reload); the
    * scrollback replays first, then live output. */
   const attachAgent = (
@@ -374,6 +453,8 @@ export function createHelmApi(invoke: InvokeFn, makeChannel?: ChannelFactory) {
     listProfiles,
     updateProfile,
     spawnAgent,
+    spawnShell,
+    spawnProcess,
     attachAgent,
     writeAgent,
     resizeAgent,
