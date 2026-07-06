@@ -187,9 +187,39 @@ fn is_chrome_line(line_lower: &str) -> bool {
     DIALOG_MARKERS.iter().any(|m| line_lower.contains(m)) || line_lower.contains("requires confirmation")
 }
 
+/// Command wrappers that are transparent proxies: they run the wrapped command
+/// unchanged, so a permission dialog showing `<wrapper> <cmd>` is the SAME call
+/// a card recorded as `<cmd>`. The card holds the PRE-hook command (see
+/// [`ApprovalCard::input`](crate::modules::core::control_plane::ApprovalCard)),
+/// but a user-level `PreToolUse` hook such as RTK prepends the wrapper before
+/// the dialog renders — Claude Code runs all PreToolUse hooks in PARALLEL on the
+/// ORIGINAL input, so the recording hook can never observe the rewrite, and the
+/// live command diverges from the card by exactly this prefix. Only transparent,
+/// non-privilege-changing, single-program wrappers belong here: the REMAINDER
+/// after stripping must still equal `want` EXACTLY, so this never widens into
+/// the substring hazard (a longer or different live command never matches a
+/// shorter card). `sudo`/`env`/`time`/`xargs` are deliberately excluded — they
+/// change semantics or can hide a second command.
+const TRANSPARENT_WRAPPERS: &[&str] = &["rtk"];
+
+/// Does the on-screen `candidate` command denote the same call as the card's
+/// `want`? Exact equality, OR exact equality after stripping a single leading
+/// transparent-wrapper token (`rtk git …` ≡ `git …`). Both inputs are already
+/// whitespace-collapsed, so `rest` carries no leading space.
+fn command_matches(candidate: &str, want: &str) -> bool {
+    if candidate == want {
+        return true;
+    }
+    match candidate.split_once(' ') {
+        Some((wrapper, rest)) if TRANSPARENT_WRAPPERS.contains(&wrapper) => rest == want,
+        _ => false,
+    }
+}
+
 /// Is `want` the command of the dialog currently on screen? True iff some run
 /// of consecutive non-blank visible lines ABOVE the dialog's chrome collapses
-/// to EXACTLY `want` (case-sensitive). Exact equality defeats the
+/// to EXACTLY `want` (case-sensitive), or to a transparent wrapper applied to
+/// `want` ([`command_matches`]). Exact equality defeats the
 /// substring/prefix hazard — a card command that is only a prefix of a longer,
 /// more dangerous live command ("git push" vs the on-screen "git push --force
 /// origin main") never matches. The multi-line run tolerates a soft-wrapped
@@ -216,12 +246,45 @@ fn command_is_on_screen(lines: &[String], want: &str) -> bool {
                 break; // a command is contiguous — don't span a blank row
             }
             run.push(line);
-            if collapse_ws(&run.join(" ")) == want {
+            if command_matches(&collapse_ws(&run.join(" ")), want) {
                 return true;
             }
         }
     }
     false
+}
+
+/// Test-only calibration aid: render a snapshot EXACTLY as the matcher sees it
+/// — the stripped visible lines, numbered, with the chrome boundary marked and
+/// the `command_is_on_screen` verdict. The live canary prints this so a real
+/// mismatch reveals the true Claude Code layout to calibrate against, instead
+/// of guessing. Not compiled into release builds.
+#[cfg(test)]
+pub(crate) fn debug_dump_screen(snapshot: &[u8], want: &str) -> String {
+    use std::fmt::Write as _;
+    let lines = visible_lines(snapshot);
+    let region_end = lines
+        .iter()
+        .position(|line| is_chrome_line(&line.to_lowercase()))
+        .unwrap_or(lines.len());
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\n=== visible screen: {} lines, chrome boundary at {} (command searched in lines 0..{}) ===",
+        lines.len(),
+        region_end,
+        region_end
+    );
+    for (i, line) in lines.iter().enumerate() {
+        let flag = if i == region_end { " <== first chrome line" } else { "" };
+        let _ = writeln!(out, "{i:>3} | {line:?}{flag}");
+    }
+    let _ = writeln!(
+        out,
+        "=== command_is_on_screen({want:?}) = {} ===",
+        command_is_on_screen(&lines, want)
+    );
+    out
 }
 
 /// The pure plan for answering a Claude Code permission dialog: verify the
@@ -232,7 +295,9 @@ fn command_is_on_screen(lines: &[String], want: &str) -> bool {
 /// check — never resume a differently-cased command, and never resume a
 /// command that only *contains* the card's command as a substring/prefix); it
 /// is anchored to the dialog's own command row(s), not matched anywhere in the
-/// screen. Dialog-presence markers are matched case-insensitively (layout copy,
+/// screen. The one tolerated divergence is a leading transparent-wrapper token
+/// ([`TRANSPARENT_WRAPPERS`], e.g. `rtk`) a user-level hook prepended after the
+/// card was recorded — the remainder must still equal the card command exactly. Dialog-presence markers are matched case-insensitively (layout copy,
 /// not identity). The snapshot passed here is the CURRENT visible screen (the
 /// Runtime's `capture-pane`), so a dismissed or a queued-underneath dialog is
 /// not on it — the seam verifies against what is truly live (user story 30).
@@ -448,6 +513,51 @@ mod tests {
         let screen = live_layout_screen("git commit --amend --no-edit");
         let err = allow(&screen, "git commit").unwrap_err();
         assert_eq!(err, Mismatch::DialogNotVisible);
+    }
+
+    // --- transparent command wrappers (RTK): a user-level PreToolUse hook
+    // prepends `rtk `, so the LIVE command diverges from the card by exactly
+    // that token. The card holds the pre-rewrite command; the wrapper strip
+    // reconciles them WITHOUT reopening the substring hazard (task #18 live). ---
+
+    #[test]
+    fn rtk_wrapped_live_command_matches_the_bare_card_command() {
+        // Exactly the captured live layout: RTK rewrote the command to
+        // "rtk git commit --amend --no-edit" on screen, but the card recorded
+        // the pre-rewrite "git commit --amend --no-edit". Stripping the
+        // transparent wrapper reconciles them → Allow injects.
+        let screen = live_layout_screen("rtk git commit --amend --no-edit");
+        let steps = allow(&screen, "git commit --amend --no-edit").unwrap();
+        assert_eq!(steps, vec![KeyStep::Inject(b"1".to_vec())]);
+    }
+
+    #[test]
+    fn rtk_wrapped_still_rejects_a_shorter_prefix_card() {
+        // The wrapper strip must not widen into the substring hazard: card
+        // "git commit" vs live "rtk git commit --amend --no-edit" — the
+        // REMAINDER after stripping rtk ("git commit --amend --no-edit") is not
+        // exactly "git commit", so it must mismatch.
+        let screen = live_layout_screen("rtk git commit --amend --no-edit");
+        let err = allow(&screen, "git commit").unwrap_err();
+        assert_eq!(
+            err,
+            Mismatch::DialogNotVisible,
+            "stripping a wrapper must still require the remainder to match exactly"
+        );
+    }
+
+    #[test]
+    fn a_non_transparent_wrapper_is_not_stripped() {
+        // `sudo` is NOT a transparent wrapper (privilege change): a card for
+        // "git commit --amend --no-edit" must NOT resume a live
+        // "sudo git commit --amend --no-edit" dialog.
+        let screen = live_layout_screen("sudo git commit --amend --no-edit");
+        let err = allow(&screen, "git commit --amend --no-edit").unwrap_err();
+        assert_eq!(
+            err,
+            Mismatch::DialogNotVisible,
+            "only allowlisted transparent wrappers are stripped"
+        );
     }
 
     #[test]

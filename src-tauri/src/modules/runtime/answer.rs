@@ -522,6 +522,17 @@ mod live {
             "a non-visible command must never be answered, got {mismatch:?}"
         );
 
+        // Calibration aid: dump the real screen exactly as the matcher sees it.
+        // If the deny below fails with DialogNotVisible, this listing (visible
+        // with `--nocapture`) shows the true layout — where the command sits,
+        // where the chrome boundary lands — so command_is_on_screen /
+        // is_chrome_line can be calibrated against reality, not a guess.
+        let live_screen = rt.snapshot(&session).unwrap_or_default();
+        eprintln!(
+            "{}",
+            crate::modules::harness::answer::debug_dump_screen(&live_screen, expected)
+        );
+
         // Deny-with-reason on the real dialog: the tool verifiably never runs.
         let intended = IntendedDialog {
             tool_use_id: Some("toolu_live"),
