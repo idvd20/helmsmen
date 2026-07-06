@@ -214,6 +214,18 @@ impl Runtime for LocalPty {
         writer.write_all(bytes).map_err(|e| e.to_string())
     }
 
+    fn snapshot(&self, session: &str) -> Result<Vec<u8>, String> {
+        let session = self.get(session)?;
+        // Read-only: clone the retained scrollback under the same lock that
+        // guards the live sink, so a snapshot never races an in-flight chunk.
+        // The live sink is untouched — verify-before-inject reads the screen
+        // without disturbing the UI's stream. Bind to a local so the
+        // MutexGuard temporary drops before `session` (tail-expression drop
+        // order).
+        let screen = session.ctl.lock().expect("ctl lock poisoned").scrollback.clone();
+        Ok(screen)
+    }
+
     fn resize(&self, session: &str, cols: u16, rows: u16) -> Result<(), String> {
         if cols == 0 || rows == 0 {
             return Err("resize: cols and rows must be non-zero".to_string());

@@ -670,6 +670,9 @@ mod tests {
         fn write(&self, _s: &str, _b: &[u8]) -> Result<(), String> {
             Err("unused".to_string())
         }
+        fn snapshot(&self, _s: &str) -> Result<Vec<u8>, String> {
+            Err("unused".to_string())
+        }
         fn resize(&self, _s: &str, _c: u16, _r: u16) -> Result<(), String> {
             Err("unused".to_string())
         }

@@ -86,6 +86,13 @@ describe("mapZoomKey", () => {
     expect(mapZoomKey({ key: "m" }, ctx())).toEqual({ kind: "focus-message" });
   });
 
+  it("a/x answer a paused approval inline (Allow / Deny), decoupled from m", () => {
+    expect(mapZoomKey({ key: "a" }, ctx())).toEqual({ kind: "answer-allow" });
+    expect(mapZoomKey({ key: "x" }, ctx())).toEqual({ kind: "answer-deny" });
+    // Steering stays available independently of any pending ask.
+    expect(mapZoomKey({ key: "m" }, ctx())).toEqual({ kind: "focus-message" });
+  });
+
   it("yields every key while a message is being typed", () => {
     // The message box owns the keyboard; chrome keys (digits, brackets,
     // Esc) must reach the field, not the zoom navigation.

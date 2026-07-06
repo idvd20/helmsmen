@@ -12,12 +12,15 @@
 //! (`modules::runtime::spawn`). A guard test below enforces this.
 
 pub mod agent_signal;
+pub mod answer;
 pub mod claude_code;
 pub mod commands;
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+
+pub use answer::{IntendedDialog, KeyStep, Mismatch, PromptAnswer};
 
 /// What a Harness can do, declared in code at compile time.
 ///
@@ -108,6 +111,26 @@ pub trait Harness: Send + Sync {
     /// launch. Empty means nothing to write (claude-code at M1; hook
     /// wiring arrives at M3).
     fn config_injection(&self, ctx: &LaunchContext) -> Vec<ConfigFile>;
+
+    /// Verify-before-inject: given the agent's CURRENT visible screen
+    /// (`snapshot`, a Runtime `capture-pane` read), the intended dialog (the
+    /// card being answered), and the user's answer, return the exact key steps
+    /// to inject — or a [`Mismatch`] meaning **inject nothing** (the on-screen
+    /// dialog is not this card's). This is the pure decision half of the ONE
+    /// fragile seam (task #18); the imperative half lives in
+    /// [`crate::modules::runtime::answer`]. A Harness that has an interactive
+    /// permission prompt (Claude Code) overrides this with its own key
+    /// sequences, re-verified against a live agent per release. The default is
+    /// the safe no-op: a Harness with no send-keys approval prompt (a
+    /// Signal-only agent) never injects anything.
+    fn answer_plan(
+        &self,
+        _snapshot: &[u8],
+        _dialog: &IntendedDialog,
+        _answer: &PromptAnswer,
+    ) -> Result<Vec<KeyStep>, Mismatch> {
+        Err(Mismatch::NoDialog)
+    }
 }
 
 /// Every built-in Harness. `byoa` (bring-your-own-agent) joins post-M6.

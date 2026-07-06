@@ -29,6 +29,7 @@
 //! core — a guard test in `modules::registry` enforces that
 //! `modules::core` imports no network, async, or process code.
 
+pub mod commands;
 pub mod config;
 pub mod registry;
 pub mod server;

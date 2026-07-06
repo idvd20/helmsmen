@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vitest";
-import type { HelmProcessDef, HelmSession } from "@/modules/helm/api";
+import type {
+  HelmApproval,
+  HelmProcessDef,
+  HelmSession,
+} from "@/modules/helm/api";
 import {
+  derivePausedCalls,
   firstZoomTarget,
   groupSessions,
   harnessToken,
   hopZoomTarget,
   messageToPtyLine,
+  pickAgentSession,
   processDefLabel,
   resolveZoomTarget,
   sessionTabLabel,
   toZoomSession,
+  type ZoomSession,
 } from "./zoomModel";
 
 // Pure derivation for the zoom view (#12/#13): which Workspace owns a clicked
@@ -195,5 +202,75 @@ describe("messageToPtyLine", () => {
 
   it("sends a bare carriage return for an empty message", () => {
     expect(messageToPtyLine("")).toBe("\r");
+  });
+});
+
+// Inline approval answering (task #18): the zoom shows a blocked agent's
+// paused call and answers it in place, so a decision never requires the wall.
+describe("derivePausedCalls", () => {
+  const ask = (over: Partial<HelmApproval> = {}): HelmApproval => ({
+    id: "card-1",
+    seq: 1,
+    sessionId: "s1",
+    toolName: "Bash",
+    toolUseId: "toolu_a",
+    status: "pending",
+    decision: "ask",
+    rule: { id: "git-history-rewrite", label: "git history rewrite" },
+    input: { command: "git push --force origin main" },
+    ...over,
+  });
+
+  it("distills an open ask, KEEPING the toolUseId for reconciliation", () => {
+    expect(derivePausedCalls([ask()])).toEqual([
+      {
+        id: "card-1",
+        toolUseId: "toolu_a",
+        tool: "Bash",
+        rule: "git history rewrite",
+        command: "git push --force origin main",
+      },
+    ]);
+  });
+
+  it("shows only open ask cards (never allow/deny, never resolved)", () => {
+    const list: HelmApproval[] = [
+      ask({ id: "allow", decision: "allow", rule: undefined }),
+      ask({ id: "deny", decision: "deny" }),
+      ask({ id: "ran", status: "allowed" }),
+      ask({ id: "closed", status: "closedNoRun" }),
+      ask({ id: "open", status: "surfaced" }),
+    ];
+    expect(derivePausedCalls(list).map((c) => c.id)).toEqual(["open"]);
+    expect(derivePausedCalls(undefined)).toEqual([]);
+  });
+
+  it("falls back to the file path when there is no command", () => {
+    const c = derivePausedCalls([
+      ask({ toolName: "Read", input: { filePath: "config/.env.production" } }),
+    ]);
+    expect(c[0].command).toBe("config/.env.production");
+  });
+});
+
+describe("pickAgentSession", () => {
+  const zs = (kind: ZoomSession["kind"], sessionId: string): ZoomSession => ({
+    sessionId,
+    runtime: "local-pty",
+    kind,
+    label: kind,
+  });
+
+  it("targets the first agent tab (keys inject into the agent, not a shell)", () => {
+    const picked = pickAgentSession([
+      zs("shell", "s1"),
+      zs("agent", "a1"),
+      zs("agent", "a2"),
+    ]);
+    expect(picked?.sessionId).toBe("a1");
+  });
+
+  it("is null when the Workspace has no agent Session", () => {
+    expect(pickAgentSession([zs("shell", "s1"), zs("process", "p1")])).toBeNull();
   });
 });

@@ -665,6 +665,8 @@ export type HelmWallAction =
   | { kind: "open-repo-picker" }
   | { kind: "close-repo-picker" }
   | { kind: "clear-filters" }
+  | { kind: "answer-allow" }
+  | { kind: "answer-deny" }
   | { kind: "none" };
 
 /** The subset of a KeyboardEvent the map reads (plain data, so tests need
@@ -691,7 +693,9 @@ export interface HelmWallKeyContext {
 /** Map a wall key press to an action. Modified chords (Ctrl/Meta/Alt),
  * every key while a field is focused, and every key while an overlay is
  * open are left alone. While the repo picker is open it owns the keys
- * (`r`/`esc` close it; everything else is inert). */
+ * (`r`/`esc` close it; everything else is inert). `a`/`x` answer the
+ * selected/blocked card's paused approval (Allow / Deny) — the container
+ * resolves which card and injects nothing if none is answerable. */
 export function mapHelmWallKey(
   ev: HelmWallKeyInput,
   ctx: HelmWallKeyContext,
@@ -712,6 +716,10 @@ export function mapHelmWallKey(
       return { kind: "cycle-group" };
     case "r":
       return { kind: "open-repo-picker" };
+    case "a":
+      return { kind: "answer-allow" };
+    case "x":
+      return { kind: "answer-deny" };
     case "Escape":
       return { kind: "clear-filters" };
     default:

@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  type AnswerPromptInput,
   type ChannelFactory,
   createHelmApi,
   deriveWorkspaceStatus,
   HELM_STATUS_ALIAS,
   type HelmAgentSession,
+  type HelmControlPlaneState,
   type HelmCutWorkspace,
   type HelmHarness,
   type HelmProfile,
@@ -454,6 +456,66 @@ describe("createHelmApi agent sessions", () => {
     const api = createHelmApi(invoke);
     await expect(api.listHarnesses()).resolves.toEqual([harness]);
     expect(calls).toEqual([["helm_list_harnesses", undefined]]);
+  });
+});
+
+// The approval-answering seam (task #18): the frontend reads a Workspace's
+// control-plane snapshot and answers a paused call through exactly these two
+// commands. The verify-before-inject logic itself is proven in the Rust tests
+// (harness::answer / runtime::answer); here we lock the invoke payloads.
+describe("approval answering seam", () => {
+  it("approvalsSnapshot reads a Workspace's control-plane state by id", async () => {
+    const state: HelmControlPlaneState = {
+      cards: [],
+      warnings: [],
+      eventCount: 0,
+      records: [],
+    };
+    const { invoke, calls } = fakeInvoke({ helm_approvals_snapshot: state });
+    const api = createHelmApi(invoke);
+    await expect(api.approvalsSnapshot("ws-1")).resolves.toEqual(state);
+    expect(calls).toEqual([
+      ["helm_approvals_snapshot", { workspaceId: "ws-1" }],
+    ]);
+  });
+
+  it("approvalsSnapshot passes a null through (no running endpoint)", async () => {
+    const { invoke } = fakeInvoke({ helm_approvals_snapshot: null });
+    const api = createHelmApi(invoke);
+    await expect(api.approvalsSnapshot("ws-x")).resolves.toBeNull();
+  });
+
+  it("answerPrompt sends the card identity + answer to the ONE seam", async () => {
+    const { invoke, calls } = fakeInvoke({
+      helm_answer_prompt: { status: "injected" },
+    });
+    const api = createHelmApi(invoke);
+    const input: AnswerPromptInput = {
+      session: "lpty-1",
+      runtime: "local-pty",
+      toolUseId: "toolu_a",
+      expectedCommand: "git push --force origin main",
+      action: "deny",
+      reason: "open a PR instead",
+    };
+    await expect(api.answerPrompt(input)).resolves.toEqual({
+      status: "injected",
+    });
+    expect(calls).toEqual([["helm_answer_prompt", { input }]]);
+  });
+
+  it("answerPrompt surfaces a mismatch verbatim (nothing was injected)", async () => {
+    const { invoke } = fakeInvoke({
+      helm_answer_prompt: { status: "mismatch", reason: "dialogNotVisible" },
+    });
+    const api = createHelmApi(invoke);
+    await expect(
+      api.answerPrompt({
+        session: "lpty-1",
+        expectedCommand: "git push --force origin main",
+        action: "allow",
+      }),
+    ).resolves.toEqual({ status: "mismatch", reason: "dialogNotVisible" });
   });
 });
 
