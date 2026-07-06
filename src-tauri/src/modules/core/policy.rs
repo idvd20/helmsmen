@@ -37,6 +37,21 @@
 //! (private keys). Hard-deny is checked first and, in the shell, is enforced
 //! by the hook return so it is robust regardless of the agent's prompt
 //! layout.
+//!
+//! # Structural screening (task #31)
+//!
+//! The screen is not a shell, so shell STRUCTURE must never hide a command
+//! from it. Segmentation therefore breaks on every command-running operator —
+//! `;`, `|`/`||`, `&`/`&&`, backticks, and parentheses (`$(…)`, `<(…)`,
+//! subshells) — and each segment is screened on the program it actually runs
+//! (transparent wrappers such as `env`, `nohup`, `eval`, `xargs`, `bash -c`
+//! are stripped first). Output redirections are writes: a `>`/`>>` target
+//! outside the worktree asks like any other destructive op. A `cd` to
+//! anywhere not provably inside the worktree taints every later relative
+//! destructive target (unknown cwd asks, never allows). Where the screen
+//! over-approximates — quoted text split at an operator, an unresolvable
+//! target — the error is always toward a stricter verdict, never a looser
+//! one.
 
 use serde::Serialize;
 
@@ -241,27 +256,31 @@ pub fn decide(_tool_name: &str, input: &ToolInput, ctx: &PolicyContext) -> Decis
 
 // ── command tokenizing ──────────────────────────────────────────────────
 
-/// Split a command line into the segments a shell would run in sequence,
-/// breaking on `;`, newline, `|`, `&&`, and `||`. Char-safe (never slices a
-/// multibyte boundary). This is intentionally coarse — it is a risk screen,
-/// not a shell — but it means an operator-chained `foo && sudo bar` is
-/// screened segment by segment rather than by the leading program alone.
+/// Split a command line into the segments a shell would run, breaking on
+/// `;`, newline, `|`/`||`, `&`/`&&` (a lone `&` backgrounds the left side —
+/// it separates commands exactly like `;`), backticks, and parentheses
+/// (subshells and `$(…)`/`<(…)` substitutions run their contents). Char-safe
+/// (never slices a multibyte boundary). This is intentionally coarse — it is
+/// a risk screen, not a shell — and it deliberately over-splits, even inside
+/// quotes: a dangerous program can never hide behind an operator, at the
+/// cost of occasionally screening quoted text as if it were a command, which
+/// can only produce a STRICTER verdict, never a looser one (fail safe).
 fn command_segments(cmd: &str) -> Vec<String> {
+    // `>|` (noclobber override) writes exactly like `>`; normalize it so the
+    // redirect scan sees a plain `>` and the `|` does not read as a pipe.
+    let cmd = cmd.replace(">|", "> ");
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut chars = cmd.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            ';' | '\n' => out.push(std::mem::take(&mut cur)),
-            '&' if chars.peek() == Some(&'&') => {
-                chars.next();
+            ';' | '\n' | '`' | '(' | ')' => out.push(std::mem::take(&mut cur)),
+            '&' | '|' => {
+                if chars.peek() == Some(&c) {
+                    chars.next();
+                }
                 out.push(std::mem::take(&mut cur));
             }
-            '|' if chars.peek() == Some(&'|') => {
-                chars.next();
-                out.push(std::mem::take(&mut cur));
-            }
-            '|' => out.push(std::mem::take(&mut cur)),
             other => cur.push(other),
         }
     }
@@ -280,27 +299,45 @@ fn is_env_assignment(tok: &str) -> bool {
     }
 }
 
-/// The program a segment runs, skipping a leading `env` and any `VAR=val`
-/// assignments.
-fn first_program<'a>(toks: &[&'a str]) -> Option<&'a str> {
-    for t in toks {
-        if *t == "env" || is_env_assignment(t) {
-            continue;
+/// Leading tokens that transparently run whatever follows them (or shell
+/// grouping / negation prefixes). Skipped when resolving the program a
+/// segment actually runs, so `nohup sudo …`, `bash -c 'sudo …'`, or
+/// `{ rm … ; }` cannot hide the real program behind a wrapper.
+const TRANSPARENT_WRAPPERS: &[&str] = &[
+    "env", "command", "builtin", "exec", "eval", "nohup", "time", "xargs", "sh", "bash", "zsh",
+    "dash", "fish", "{", "!",
+];
+
+/// Strip leading `VAR=val` assignments, transparent wrappers, and any flag
+/// tokens between a wrapper and its command (`env -i sudo …`, `bash -c …`),
+/// leaving the program a segment actually runs plus its operands.
+fn strip_wrappers<'a, 'b>(toks: &'b [&'a str]) -> &'b [&'a str] {
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        let is_flag = t.len() > 1 && t.starts_with('-');
+        if TRANSPARENT_WRAPPERS.contains(&t) || is_env_assignment(t) || is_flag {
+            i += 1;
+        } else {
+            break;
         }
-        return Some(*t);
     }
-    None
+    &toks[i..]
+}
+
+/// The program a segment runs: wrappers and assignments stripped, quotes and
+/// escaping backslashes removed so `"sudo"` / `\sudo` still read as `sudo`.
+fn first_program<'a>(toks: &[&'a str]) -> Option<&'a str> {
+    strip_wrappers(toks)
+        .first()
+        .map(|t| unquote(t).trim_start_matches('\\'))
 }
 
 /// The non-flag path arguments of a segment (everything after the program
 /// that is not a `-flag`), with `dd`'s `if=`/`of=` values unwrapped.
 fn path_args<'a>(toks: &[&'a str]) -> Vec<&'a str> {
-    let mut idx = 0;
-    while idx < toks.len() && (toks[idx] == "env" || is_env_assignment(toks[idx])) {
-        idx += 1;
-    }
     let mut out = Vec::new();
-    for t in toks.iter().skip(idx + 1) {
+    for t in strip_wrappers(toks).iter().skip(1) {
         if let Some(v) = t.strip_prefix("of=").or_else(|| t.strip_prefix("if=")) {
             out.push(v);
         } else if t.starts_with('-') {
@@ -310,6 +347,44 @@ fn path_args<'a>(toks: &[&'a str]) -> Vec<&'a str> {
         }
     }
     out
+}
+
+/// Filesystem targets of output redirections (`>` / `>>` / `N>`, attached or
+/// spaced) within one segment's tokens. Fd duplications (`2>&1`, `>&2`) have
+/// no path target and are skipped.
+fn redirect_targets<'a>(toks: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = toks[i];
+        if let Some(pos) = tok.rfind('>') {
+            let after = &tok[pos + 1..];
+            if after.starts_with('&') {
+                // fd duplication — no path target
+            } else if unquote(after).is_empty() {
+                // spaced form (`> file`): the next token is the target
+                if let Some(next) = toks.get(i + 1) {
+                    if !next.starts_with('<') && !next.contains('>') {
+                        out.push(*next);
+                        i += 1;
+                    }
+                }
+            } else {
+                // attached form (`>file`, `1>>file`)
+                out.push(after);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Writable device sinks that are safe redirect targets from anywhere.
+fn is_dev_sink(path: &str) -> bool {
+    matches!(
+        unquote(path),
+        "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
+    )
 }
 
 fn unquote(arg: &str) -> &str {
@@ -396,7 +471,13 @@ fn is_git_history_rewrite(cmd: &str) -> bool {
         }
         let has = |s: &str| toks.contains(&s);
         let force_flag = toks.iter().any(|t| *t == "-f" || t.starts_with("--force"));
-        if has("push") && force_flag {
+        // A `+refspec` (`git push origin +main:main`) forces the ref update
+        // exactly like `--force` — screen it the same way.
+        let plus_refspec = toks.iter().any(|t| {
+            let t = unquote(t);
+            t.len() > 1 && t.starts_with('+')
+        });
+        if has("push") && (force_flag || plus_refspec) {
             return true;
         }
         if has("rebase") {
@@ -545,19 +626,62 @@ fn escapes_worktree(raw: &str, root: &str, home: &str) -> bool {
     relative_escapes(arg)
 }
 
+/// Is this target anchored (absolute or home-rooted), i.e. independent of
+/// the — possibly unknown — current directory?
+fn is_anchored(arg: &str) -> bool {
+    arg.starts_with('/')
+        || arg == "~"
+        || arg.starts_with("~/")
+        || arg == "$HOME"
+        || arg.starts_with("$HOME/")
+        || arg == "${HOME}"
+        || arg.starts_with("${HOME}/")
+}
+
+/// [`escapes_worktree`], additionally treating every relative target as
+/// escaping once the segment chain has `cd`'d somewhere not provably inside
+/// the worktree. Fail safe: an unknowable cwd yields an ask, never an allow.
+fn target_escapes(raw: &str, root: &str, home: &str, cwd_escaped: bool) -> bool {
+    if cwd_escaped && !is_anchored(unquote(raw)) {
+        return true;
+    }
+    escapes_worktree(raw, root, home)
+}
+
 fn is_destructive_outside(cmd: &str, root: &str, home: &str) -> bool {
-    const PROGS: &[&str] = &["rm", "rmdir", "mv", "cp", "shred", "truncate", "dd"];
+    const PROGS: &[&str] = &["rm", "rmdir", "mv", "cp", "shred", "truncate", "dd", "tee"];
+    // Tracked across segments: has a `cd`/`pushd` moved the cwd somewhere not
+    // provably inside the worktree? Once true, a relative target can no
+    // longer be trusted as in-tree; an absolute in-tree `cd` restores trust.
+    let mut cwd_escaped = false;
     for seg in command_segments(cmd) {
         let toks: Vec<&str> = seg.split_whitespace().collect();
+        // A `>` / `>>` write to a path outside the worktree is destructive
+        // regardless of which program produced the bytes.
+        if redirect_targets(&toks)
+            .iter()
+            .any(|t| !is_dev_sink(t) && target_escapes(t, root, home, cwd_escaped))
+        {
+            return true;
+        }
         let Some(prog) = first_program(&toks) else {
             continue;
         };
+        if prog == "cd" || prog == "pushd" {
+            cwd_escaped = match path_args(&toks).first() {
+                // Bare `cd` goes to $HOME; `cd -` is unknowable. Both are
+                // outside anything we can prove in-tree.
+                None => true,
+                Some(t) => target_escapes(t, root, home, cwd_escaped),
+            };
+            continue;
+        }
         if !PROGS.contains(&prog) {
             continue;
         }
         if path_args(&toks)
             .iter()
-            .any(|a| escapes_worktree(a, root, home))
+            .any(|a| target_escapes(a, root, home, cwd_escaped))
         {
             return true;
         }
@@ -847,6 +971,143 @@ mod tests {
             .rule_label()
             .unwrap()
             .contains(".ssh"));
+    }
+
+    // ── #31: structural bypass vectors must never land on Allow ──────────
+
+    #[test]
+    fn background_operator_does_not_hide_sudo() {
+        // A lone `&` is a segment separator: the sudo after it is screened.
+        assert_eq!(
+            decide_bash("echo hi & sudo rm -rf /etc"),
+            Decision::Deny(DenyRule::Sudo)
+        );
+        // A backgrounded destructive op is screened like any other segment.
+        assert_eq!(
+            decide_bash("rm -rf /etc & echo done"),
+            Decision::Ask(RiskRule::DestructiveOutsideWorktree)
+        );
+    }
+
+    #[test]
+    fn redirection_writes_outside_the_worktree_ask() {
+        for cmd in [
+            "echo pwned > /etc/cron.d/backdoor",
+            "echo pwned >/etc/cron.d/backdoor",
+            "echo pwned >> ~/.zprofile",
+            "printf x 1> /etc/motd",
+            "echo x >| /etc/motd",
+        ] {
+            assert_eq!(
+                decide_bash(cmd),
+                Decision::Ask(RiskRule::DestructiveOutsideWorktree),
+                "{cmd:?} writes outside the worktree"
+            );
+        }
+        // In-tree and device-sink redirects stay free.
+        assert_eq!(decide_bash("echo hi > out.txt"), Decision::Allow);
+        assert_eq!(decide_bash("cargo test > /dev/null 2>&1"), Decision::Allow);
+        assert_eq!(decide_bash("git status 2>&1"), Decision::Allow);
+        assert_eq!(
+            decide_bash("rg TODO src > notes/todo.txt"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn cd_out_of_the_worktree_taints_relative_destructive_targets() {
+        for cmd in [
+            "cd / && rm -rf etc",
+            "cd /tmp; rm -rf sessions",
+            "cd .. && rm -rf other-checkout",
+            "cd && rm -rf .config",
+        ] {
+            assert_eq!(
+                decide_bash(cmd),
+                Decision::Ask(RiskRule::DestructiveOutsideWorktree),
+                "{cmd:?} deletes outside the worktree after a cd"
+            );
+        }
+        // cd within the worktree keeps in-tree destructive ops free.
+        assert_eq!(decide_bash("cd src && rm -rf build"), Decision::Allow);
+        assert_eq!(
+            decide_bash("cd /Users/dev/wt/feature/sub && rm -rf node_modules"),
+            Decision::Allow
+        );
+        // Returning into the worktree by absolute path restores trust.
+        assert_eq!(
+            decide_bash("cd /tmp && cd /Users/dev/wt/feature && rm -rf dist"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn plus_refspec_force_push_asks() {
+        for cmd in [
+            "git push origin +main:main",
+            "git push origin +refs/heads/main",
+            "rtk git push origin +main",
+        ] {
+            assert_eq!(
+                decide_bash(cmd),
+                Decision::Ask(RiskRule::GitHistoryRewrite),
+                "{cmd:?} force-pushes via a +refspec"
+            );
+        }
+        // Plain fast-forward pushes stay free.
+        assert_eq!(decide_bash("git push origin main"), Decision::Allow);
+        assert_eq!(decide_bash("git push origin main:main"), Decision::Allow);
+    }
+
+    #[test]
+    fn substitution_and_subshells_do_not_hide_commands() {
+        assert_eq!(
+            decide_bash("x=$(sudo cat /etc/shadow)"),
+            Decision::Deny(DenyRule::Sudo)
+        );
+        assert_eq!(
+            decide_bash("x=`sudo cat /etc/shadow`"),
+            Decision::Deny(DenyRule::Sudo)
+        );
+        assert_eq!(
+            decide_bash("(cd / && rm -rf etc)"),
+            Decision::Ask(RiskRule::DestructiveOutsideWorktree)
+        );
+        assert_eq!(
+            decide_bash("cat <(sudo ls /root)"),
+            Decision::Deny(DenyRule::Sudo)
+        );
+        // Benign substitutions stay free.
+        assert_eq!(decide_bash("echo $(date)"), Decision::Allow);
+        assert_eq!(
+            decide_bash("VERSION=$(git describe) cargo build"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn transparent_wrappers_do_not_hide_sudo() {
+        for cmd in [
+            "nohup sudo shutdown -h now",
+            "eval sudo reboot",
+            "bash -c 'sudo rm -rf /'",
+            "xargs sudo rm",
+        ] {
+            assert_eq!(
+                decide_bash(cmd),
+                Decision::Deny(DenyRule::Sudo),
+                "{cmd:?} runs sudo through a transparent wrapper"
+            );
+        }
+    }
+
+    #[test]
+    fn tee_outside_the_worktree_asks() {
+        assert_eq!(
+            decide_bash("echo 1 | tee /etc/hosts"),
+            Decision::Ask(RiskRule::DestructiveOutsideWorktree)
+        );
+        assert_eq!(decide_bash("pnpm test | tee test.log"), Decision::Allow);
     }
 
     // ── the spike corpus: every captured PreToolUse is an ordinary git
