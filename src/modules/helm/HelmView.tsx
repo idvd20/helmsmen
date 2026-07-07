@@ -29,10 +29,12 @@ import {
 import {
   type HelmApproval,
   createHelmApi,
+  type HelmBulkAction,
   type HelmProfile,
   type HelmProject,
   type HelmWorkspace,
 } from "./api";
+import { executeBulkAnswers } from "./bulkAnswer";
 import { Helm } from "./Helm";
 import {
   buildWall,
@@ -40,6 +42,7 @@ import {
   deriveBulkAnswerPlan,
   deriveCardAnswerItem,
   describeAnswerOutcome,
+  filterPlanToAsks,
   type WallAnswerTarget,
   type WallView,
   type WorkspaceFacts,
@@ -253,54 +256,48 @@ export function HelmView({ onZoomSession, keyboardActive = true }: HelmViewProps
   // the same pending queue the cards read. Rendered only when >1 is pending.
   const bulk = useMemo(() => deriveBulkApprovals(wall.cards), [wall.cards]);
 
-  // Bulk Allow-all / Deny-all: reuse #18's verify-before-inject `answer_prompt`
-  // per pending ask, iterating the whole queue. The bulk decision is logged
-  // DISTINCTLY (a bulk-flagged approval record) before the injections, so the
-  // audit trail captures the queue the user acted on even if a call resolves
-  // mid-loop. Correlation stays strictly by tool_use_id, so each paused call
-  // resumes exactly where it paused.
+  // The wall's answer feedback line (tasks #34/#32): every non-answer — an
+  // ask already resolved, no agent Session, a verify-before-inject mismatch
+  // (the backend injected NOTHING), an unreachable agent — surfaces here
+  // instead of a silent no-op. Shared by the per-card and bulk paths.
+  const [answerNote, setAnswerNote] = useState<string | null>(null);
+
+  // Bulk Allow-all / Deny-all (task #19, made fail-safe under #32): reuse
+  // #18's verify-before-inject `answer_prompt` per pending ask. The safety
+  // ordering lives in `executeBulkAnswers`: every card is ANSWERED first (a
+  // `mismatch` resolves without throwing and injected NOTHING), the DISTINCT
+  // bulk log is appended only for Workspaces whose still-pending asks were
+  // all actually answered, and every miss lands on the answer note.
+  // Allow-all fires against the ARM-TIME snapshot (`reviewedAskIds`) so an
+  // ask that arrived after the user reviewed the queue is never silently
+  // allowed; Deny-all acts on the live queue (denying an unreviewed ask
+  // fails safe). Correlation stays strictly by tool_use_id, so each paused
+  // call resumes exactly where it paused.
   const runBulk = useCallback(
-    async (action: "allowAll" | "denyAll") => {
-      const plan = deriveBulkAnswerPlan(liveFacts);
+    async (action: HelmBulkAction, reviewedAskIds?: readonly string[]) => {
+      setAnswerNote(null);
+      const live = deriveBulkAnswerPlan(liveFacts);
+      const plan = reviewedAskIds
+        ? filterPlanToAsks(live, reviewedAskIds)
+        : live;
       if (plan.length === 0) return;
-      const workspaceIds = [...new Set(plan.map((item) => item.workspaceId))];
-      for (const workspaceId of workspaceIds) {
-        try {
-          await api.recordBulkDecision(workspaceId, action);
-        } catch {
-          // A transient log failure never blocks the decisions themselves.
-        }
-      }
-      const answer = action === "allowAll" ? "allow" : "deny";
-      for (const item of plan) {
-        if (!item.agentSession) continue; // no agent Session to receive keys
-        try {
-          await api.answerPrompt({
-            session: item.agentSession.sessionId,
-            runtime: item.agentSession.runtime,
-            toolUseId: item.toolUseId,
-            expectedCommand: item.expectedCommand,
-            action: answer,
-          });
-        } catch {
-          // A single unreachable agent skips its card; the rest proceed.
-        }
-      }
+      const { note } = await executeBulkAnswers(api, plan, action);
+      setAnswerNote(note);
     },
     [api, liveFacts],
   );
 
-  const onBulkAllow = useCallback(() => void runBulk("allowAll"), [runBulk]);
+  const onBulkAllow = useCallback(
+    (reviewedAskIds: readonly string[]) =>
+      void runBulk("allowAll", reviewedAskIds),
+    [runBulk],
+  );
   const onBulkDeny = useCallback(() => void runBulk("denyAll"), [runBulk]);
 
   // Per-card Allow/Deny from the wall (`a`/`x`, task #34): the wall resolved
   // WHICH card; resolve that ask to its live agent Session + correlation
   // anchor and answer through #18's verify-before-inject seam — the zoom's
-  // answer path, from the wall. Every non-answer (ask already resolved, no
-  // agent Session, a mismatch — the backend injected NOTHING because the
-  // visible dialog was not this card's, or an unreachable agent) surfaces as
-  // a note instead of a silent no-op. The approvals poll reconciles the card.
-  const [answerNote, setAnswerNote] = useState<string | null>(null);
+  // answer path, from the wall. The approvals poll reconciles the card.
   const onAnswerCard = useCallback(
     (target: WallAnswerTarget, action: "allow" | "deny") => {
       void (async () => {
