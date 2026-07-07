@@ -464,16 +464,39 @@ export function deriveBulkApprovals(
  * screen before injecting. */
 export interface BulkAnswerItem {
   workspaceId: string;
-  /** The Session the keys inject into — the Workspace's Agent Session, never a
+  /** The ask card's id — the stable correlation anchor. The Allow-all
+   * arm-time snapshot filters on it and the bulk record gate keys on it
+   * (task #32). */
+  askId: string;
+  /** The Session the keys inject into — the ask's own Agent Session, never a
    * shell/process. Null when no agent Session is live to receive keys. */
   agentSession: { sessionId: string; runtime: string } | null;
   toolUseId: string | null;
   expectedCommand: string;
 }
 
+/** Resolve the agent Session a card's answer keys inject into, preferring the
+ * card's OWN `sessionId` (task #32): with several live agent Sessions in one
+ * Workspace, keys directed at another card's PTY can only ever mismatch. The
+ * card's `sessionId` is the HARNESS's session id, which need not equal any
+ * PTY handle — so when it matches nothing and exactly ONE agent Session is
+ * live, the sole agent stands (no ambiguity to guard against). Several agents
+ * and no match yield null: never guess a PTY to inject into (fail safe — the
+ * miss surfaces to the user instead of silently keying the first agent). */
+function resolveAnswerSession(
+  sessions: readonly SessionFacts[] | undefined,
+  cardSessionId: string,
+): { sessionId: string; runtime: string } | null {
+  const agents = (sessions ?? []).filter((s) => s.kind === "agent");
+  const own = agents.find((s) => s.sessionId === cardSessionId);
+  const agent = own ?? (agents.length === 1 ? agents[0] : undefined);
+  return agent ? { sessionId: agent.sessionId, runtime: agent.runtime } : null;
+}
+
 /** Plan a bulk Allow-all / Deny-all: one [`BulkAnswerItem`] per pending ask
  * across every Workspace, resolved from the host facts (each Workspace's
- * approval cards + its live Sessions). The shell iterates this applying #18's
+ * approval cards + its live Sessions). Each item routes to its own card's
+ * Session ([`resolveAnswerSession`]); the shell iterates this applying #18's
  * `answer_prompt` per card; correlation stays strictly by `tool_use_id`, so a
  * bulk answer resumes each paused call exactly where it paused. Pure and
  * total. */
@@ -484,20 +507,112 @@ export function deriveBulkAnswerPlan(
   for (const [workspaceId, f] of Object.entries(facts)) {
     const asks = (f.approvals ?? []).filter(isPendingAsk);
     if (asks.length === 0) continue;
-    const agent = (f.sessions ?? []).find((s) => s.kind === "agent");
-    const agentSession = agent
-      ? { sessionId: agent.sessionId, runtime: agent.runtime }
-      : null;
     for (const a of asks) {
       plan.push({
         workspaceId,
-        agentSession,
+        askId: a.id,
+        agentSession: resolveAnswerSession(f.sessions, a.sessionId),
         toolUseId: a.toolUseId,
         expectedCommand: a.input.command ?? a.input.filePath ?? "",
       });
     }
   }
   return plan;
+}
+
+/** Restrict a bulk plan to an explicit set of ask card ids. The Allow-all
+ * confirm fires against the ARM-TIME snapshot the user reviewed, so an ask
+ * that arrived after arming is never silently allowed (task #32). Pure. */
+export function filterPlanToAsks(
+  plan: readonly BulkAnswerItem[],
+  askIds: readonly string[],
+): BulkAnswerItem[] {
+  const reviewed = new Set(askIds);
+  return plan.filter((item) => reviewed.has(item.askId));
+}
+
+/** Has the pending-ask queue changed since Allow-all was armed? Compared as an
+ * id SET — the same asks in a different (rank) order are still the queue the
+ * user reviewed; any new, resolved, or swapped ask is a change. The armed
+ * confirm must disarm on ANY change: a set change may never silently widen
+ * what gets allowed (task #32, fail safe). Pure and total. */
+export function pendingSetChanged(
+  armedIds: readonly string[],
+  currentIds: readonly string[],
+): boolean {
+  const armed = new Set(armedIds);
+  const current = new Set(currentIds);
+  if (armed.size !== current.size) return true;
+  for (const id of current) {
+    if (!armed.has(id)) return true;
+  }
+  return false;
+}
+
+/** Why a bulk-planned card was NOT answered: the verify-before-inject seam
+ * saw a different dialog (`mismatch` — it resolves, never throws, and injects
+ * NOTHING), no live agent Session could receive keys (`noAgent`), or the
+ * invoke itself failed (`unreachable`). */
+export type BulkAnswerMiss = "mismatch" | "noAgent" | "unreachable";
+
+/** One bulk-planned card's ACTUAL outcome, as the shell observed it. The
+ * misses gate the audit log ([`canRecordBulkDecision`]) and feed the wall's
+ * answer note ([`describeBulkOutcome`]) — a card that kept running is never
+ * silently reported as decided (task #32). */
+export interface BulkAnswerResult {
+  item: BulkAnswerItem;
+  outcome: "injected" | BulkAnswerMiss;
+}
+
+const BULK_MISS_LABEL: Record<BulkAnswerMiss, string> = {
+  mismatch: "dialog changed",
+  noAgent: "no agent session",
+  unreachable: "agent unreachable",
+};
+
+/** Fixed reason order so the note reads deterministically. */
+const BULK_MISS_ORDER: readonly BulkAnswerMiss[] = [
+  "mismatch",
+  "noAgent",
+  "unreachable",
+];
+
+/** The wall's feedback line for a bulk run: null when every card injected
+ * (the approvals poll drains the queue); otherwise every miss is counted by
+ * reason — a `mismatch` means the backend verified the visible dialog was NOT
+ * that card's and injected NOTHING, so the command keeps running. That must
+ * reach the user, never be discarded (the bulk sibling of
+ * [`describeAnswerOutcome`]). Pure and total. */
+export function describeBulkOutcome(
+  results: readonly BulkAnswerResult[],
+): string | null {
+  const missed = results.filter((r) => r.outcome !== "injected");
+  if (missed.length === 0) return null;
+  const reasons = BULK_MISS_ORDER.map(
+    (miss) =>
+      [miss, missed.filter((r) => r.outcome === miss).length] as const,
+  )
+    .filter(([, n]) => n > 0)
+    .map(([miss, n]) => `${n} ${BULK_MISS_LABEL[miss]}`)
+    .join(", ");
+  return `${missed.length} of ${results.length} approvals not answered (${reasons}) — still pending, not recorded; re-check those cards`;
+}
+
+/** May the DISTINCT bulk-decision log be appended for a Workspace after a
+ * bulk run? The backend appends one record per STILL-OPEN ask, Workspace-wide
+ * — so recording is safe only when every ask still pending there is one this
+ * run actually answered (injected, awaiting its async resolution). A
+ * mismatch, an unanswered card, or an ask that arrived mid-run makes the
+ * record unsafe: it would log a decision for a card nobody answered. Fail
+ * safe: skip the record (each answered call still resolves through the
+ * per-call policy trail) — a missing record beats a false one. Pure. */
+export function canRecordBulkDecision(
+  pendingAskIds: readonly string[],
+  answeredAskIds: readonly string[],
+): boolean {
+  if (answeredAskIds.length === 0) return false;
+  const answered = new Set(answeredAskIds);
+  return pendingAskIds.every((id) => answered.has(id));
 }
 
 /** The two-press confirm guarding Allow-all specifically (Deny-all is a single
@@ -918,12 +1033,9 @@ export function deriveCardAnswerItem(
     (a) => a.id === target.askId && isPendingAsk(a),
   );
   if (!ask) return null;
-  const agent = (f.sessions ?? []).find((s) => s.kind === "agent");
   return {
     workspaceId: target.workspaceId,
-    agentSession: agent
-      ? { sessionId: agent.sessionId, runtime: agent.runtime }
-      : null,
+    agentSession: resolveAnswerSession(f.sessions, ask.sessionId),
     toolUseId: ask.toolUseId,
     expectedCommand: ask.input.command ?? ask.input.filePath ?? "",
   };

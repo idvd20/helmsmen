@@ -9,6 +9,7 @@ import {
   type HelmWorkspace,
   type InvokeFn,
 } from "./api";
+import { executeBulkAnswers } from "./bulkAnswer";
 import {
   buildWall,
   deriveBulkApprovals,
@@ -272,10 +273,35 @@ describe("M3.5 demo — two Projects Blocked, one queue, one allowed + one denie
 
   it("bulk Allow-all: two-press confirm, one distinct log per Workspace + a keyed answer per card", async () => {
     const facts = pausedFacts();
-    const { invoke, calls } = fakeInvoke({
-      helm_answer_prompt: { status: "injected" },
-      helm_record_bulk_decision: 1,
-    });
+    // Snapshots at record time still show each card pending (its resolution
+    // rides the async hook path), so the answered set covers the queue.
+    const snapshots: Record<string, unknown> = {
+      wsA: {
+        cards: [ask("card-a", "toolu_a", "git push --force origin main")],
+        warnings: [],
+        eventCount: 1,
+        records: [],
+      },
+      wsB: {
+        cards: [ask("card-b", "toolu_b", "git rebase -i HEAD~3")],
+        warnings: [],
+        eventCount: 1,
+        records: [],
+      },
+    };
+    const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+    const invoke: InvokeFn = <T>(
+      cmd: string,
+      args?: Record<string, unknown>,
+    ) => {
+      calls.push([cmd, args]);
+      if (cmd === "helm_answer_prompt")
+        return Promise.resolve({ status: "injected" } as T);
+      if (cmd === "helm_approvals_snapshot")
+        return Promise.resolve(snapshots[args?.workspaceId as string] as T);
+      if (cmd === "helm_record_bulk_decision") return Promise.resolve(1 as T);
+      return Promise.resolve(null as T);
+    };
     const api = createHelmApi(invoke);
 
     // Two-press confirm guards Allow-all: the first press only arms it.
@@ -284,35 +310,32 @@ describe("M3.5 demo — two Projects Blocked, one queue, one allowed + one denie
     const second = nextAllowAllConfirm(first.armed);
     expect(second.fire).toBe(true);
 
-    // On fire, the shell runs the bulk plan: log the decision DISTINCTLY per
-    // Workspace, then inject Allow keys per pending card (reusing #18's seam).
+    // On fire, the shell runs the bulk plan through `executeBulkAnswers`
+    // (task #32): inject Allow keys per pending card (reusing #18's seam),
+    // check every outcome, THEN log the decision DISTINCTLY per Workspace —
+    // only cards actually answered enter the audit trail.
     const action: HelmBulkAction = "allowAll";
     const plan = deriveBulkAnswerPlan(facts);
-    const workspaceIds = [...new Set(plan.map((p) => p.workspaceId))];
-    for (const workspaceId of workspaceIds) {
-      await api.recordBulkDecision(workspaceId, action);
-    }
-    for (const item of plan) {
-      if (!item.agentSession) continue;
-      await api.answerPrompt({
-        session: item.agentSession.sessionId,
-        runtime: item.agentSession.runtime,
-        toolUseId: item.toolUseId,
-        expectedCommand: item.expectedCommand,
-        action: "allow",
-      });
-    }
+    const { note } = await executeBulkAnswers(api, plan, action);
+    expect(note).toBeNull(); // every card injected — nothing to surface
 
-    // One distinct bulk-log call per Workspace…
+    // One keyed answer per pending card, each targeting its own paused call…
+    const answers = calls
+      .filter(([cmd]) => cmd === "helm_answer_prompt")
+      .map(([, args]) => (args?.input as AnswerPromptInput).toolUseId);
+    expect(answers).toEqual(["toolu_a", "toolu_b"]);
+    // …then one distinct bulk-log call per Workspace, after the answers.
     const logs = calls.filter(([cmd]) => cmd === "helm_record_bulk_decision");
     expect(logs).toEqual([
       ["helm_record_bulk_decision", { workspaceId: "wsA", action: "allowAll" }],
       ["helm_record_bulk_decision", { workspaceId: "wsB", action: "allowAll" }],
     ]);
-    // …and one keyed answer per pending card, each targeting its own paused call.
-    const answers = calls
-      .filter(([cmd]) => cmd === "helm_answer_prompt")
-      .map(([, args]) => (args?.input as AnswerPromptInput).toolUseId);
-    expect(answers).toEqual(["toolu_a", "toolu_b"]);
+    const lastAnswerAt = calls.reduce(
+      (last, [cmd], i) => (cmd === "helm_answer_prompt" ? i : last),
+      -1,
+    );
+    expect(
+      calls.findIndex(([cmd]) => cmd === "helm_record_bulk_decision"),
+    ).toBeGreaterThan(lastAnswerAt);
   });
 });

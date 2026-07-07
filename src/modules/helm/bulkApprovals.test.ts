@@ -233,12 +233,14 @@ describe("deriveBulkAnswerPlan — the Allow-all/Deny-all target list", () => {
       expect.arrayContaining([
         {
           workspaceId: "wsA",
+          askId: "card-a",
           agentSession: { sessionId: "pty-a", runtime: "local-pty" },
           toolUseId: "toolu_a",
           expectedCommand: "git push --force origin main",
         },
         {
           workspaceId: "wsB",
+          askId: "card-b",
           agentSession: { sessionId: "pty-b", runtime: "local-pty" },
           toolUseId: "toolu_b",
           expectedCommand: "git rebase -i HEAD~3",
@@ -259,6 +261,7 @@ describe("deriveBulkAnswerPlan — the Allow-all/Deny-all target list", () => {
     expect(plan).toEqual([
       {
         workspaceId: "wsA",
+        askId: "card-a",
         agentSession: null,
         toolUseId: "toolu_a",
         expectedCommand: "git push --force",

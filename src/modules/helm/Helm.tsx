@@ -29,6 +29,7 @@ import {
   groupCards,
   mapHelmWallKey,
   nextAllowAllConfirm,
+  pendingSetChanged,
   type RepoPickerEntry,
   type WallAnswerTarget,
   type WallFilter,
@@ -64,10 +65,12 @@ export interface HelmProps {
    * only when `bulk.visible` (>1 pending). The container derives it from the
    * same pending queue the cards read. */
   bulk?: BulkApprovalsView;
-  /** Bulk Allow-all — the container answers every pending ask (verify-before-
+  /** Bulk Allow-all — the container answers the reviewed asks (verify-before-
    * inject `answer_prompt` per card) and logs the bulk decision distinctly.
-   * Guarded by the banner's two-press confirm. */
-  onBulkAllow?: () => void;
+   * Guarded by the banner's two-press confirm; `reviewedAskIds` is the
+   * ARM-TIME snapshot of the pending queue, so an ask that arrived after the
+   * user reviewed it is never silently allowed (task #32). */
+  onBulkAllow?: (reviewedAskIds: readonly string[]) => void;
   /** Bulk Deny-all — the container denies every pending ask. Single action
    * (no confirm). */
   onBulkDeny?: () => void;
@@ -109,26 +112,42 @@ export function Helm({
   const [group, setGroup] = useState<GroupMode>("flat");
   const [scope, setScope] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
-  // Two-press confirm for Allow-all: the first press/click arms it, the second
-  // fires. Deny-all is a single action.
-  const [allowArmed, setAllowArmed] = useState(false);
+  // Two-press confirm for Allow-all: the first press/click ARMS it over a
+  // snapshot of the pending ask ids the user is looking at; the second press
+  // fires against exactly that snapshot. Deny-all is a single action.
+  const [armedAskIds, setArmedAskIds] = useState<readonly string[] | null>(
+    null,
+  );
+  const allowArmed = armedAskIds !== null;
 
   const bulkVisible = bulk?.visible ?? false;
+  const pendingAskIds = useMemo(
+    () => (bulk?.previews ?? []).map((p) => p.id),
+    [bulk],
+  );
 
-  // A vanished banner (all pending answered) must never leave a stale armed
-  // confirm behind for the next queue.
+  // A vanished banner (all pending answered) or a CHANGED pending set must
+  // never leave a stale armed confirm behind: an ask that arrived, resolved,
+  // or swapped after arming means the user reviewed a DIFFERENT queue, so the
+  // confirm disarms rather than silently widening what gets allowed (#32).
   useEffect(() => {
-    if (!bulkVisible) setAllowArmed(false);
-  }, [bulkVisible]);
+    setArmedAskIds((armed) => {
+      if (armed === null) return armed;
+      if (!bulkVisible || pendingSetChanged(armed, pendingAskIds)) return null;
+      return armed;
+    });
+  }, [bulkVisible, pendingAskIds]);
 
   const fireBulkAllow = useCallback(() => {
     const { armed, fire } = nextAllowAllConfirm(allowArmed);
-    setAllowArmed(armed);
-    if (fire) onBulkAllow?.();
-  }, [allowArmed, onBulkAllow]);
+    // Fire against the ARM-TIME snapshot, never the live queue — even a
+    // same-tick arrival (no re-render yet) can't ride the confirm through.
+    if (fire && armedAskIds !== null) onBulkAllow?.(armedAskIds);
+    setArmedAskIds(armed ? pendingAskIds : null);
+  }, [allowArmed, armedAskIds, pendingAskIds, onBulkAllow]);
 
   const fireBulkDeny = useCallback(() => {
-    setAllowArmed(false);
+    setArmedAskIds(null);
     onBulkDeny?.();
   }, [onBulkDeny]);
 
@@ -216,7 +235,7 @@ export function Helm({
           setPickerOpen(false);
           break;
         case "clear-filters":
-          setAllowArmed(false);
+          setArmedAskIds(null);
           setFilter("all");
           setScope(null);
           break;
