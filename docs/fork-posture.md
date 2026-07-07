@@ -51,10 +51,134 @@ command guard), `2bfffae` (path guard canonical re-check vs symlink traversal),
 The only Terax files Helmsmen may edit. Grow this list deliberately; anything
 not listed is upstream's territory.
 
-- _To be enumerated during M1 as the new modules land (tracked in issue #2)._
-  Expected candidates: app entry/router registration for the Helm surface,
-  settings schema (Terax AI side-panel toggle), workspace-root authorization
-  call site used by the cut pipeline.
+- `src-tauri/src/modules/mod.rs` — module declarations for the new Helmsmen
+  backend modules (`core`, `registry`, `runtime`, `harness`, `hooks`).
+- `src-tauri/src/lib.rs` — registration only: manage
+  `registry::RegistryState` in `.setup()`, manage `runtime::RuntimeState`,
+  and list the `helm_*` commands in `invoke_handler` (tasks #4, #5, #6;
+  #7 adds the Project-settings/Profile commands, #8 adds
+  `helm_cut_pipeline` to the same list).
+- `src-tauri/Cargo.toml` — dependency additions only (task #8 adds `glob`
+  for carry-over matching; it was already in the lock as a transitive
+  dependency, and `cargo-deny check licenses` gates every addition).
+- `src/main.tsx` — install the Helm dev console (`window.helmsmen`,
+  task #4); later the Helm surface registration.
+- _Still expected during M1+ (tracked in issue #2):_ settings schema (Terax
+  AI side-panel toggle).
+
+Workspace-root authorization for the cut pipeline (task #5) needed **no**
+shared-file edit: `helm_cut_workspace` authorizes each cut worktree path via
+the existing public API `modules::workspace::WorkspaceRegistry::authorize`
+(`workspace.rs` itself stays untouched).
+
+The runtime/harness layer (task #6) likewise stays out of upstream modules:
+`modules::runtime::local_pty` builds on the `portable-pty` crate directly
+(Terax's `modules::pty` is untouched), and Agent Session spawns re-use
+`WorkspaceRegistry::authorize` for the cut worktree only.
+
+The ambient cut pipeline (task #8) lives entirely in Helmsmen modules
+(`modules::registry::pipeline` orchestrating, lifecycle events in
+`modules::core::cut`). It touches upstream only through existing public
+seams — `WorkspaceRegistry::authorize` and `modules::proc::hide_console` —
+plus the enumerated `lib.rs` command registration and the `glob`
+dependency in `Cargo.toml`.
+
+The Helm wall (task #10) added **no** shared-file edit. It lives entirely
+in `src/modules/helm`: the tested pure view-model (`viewModel.ts` — status
+rollup, rank sort, header counts, elapsed minutes, all deterministic over
+data), the presentational React surface (`Helm.tsx`, `WorkspaceCard.tsx`),
+and the host container `HelmView` (`HelmView.tsx`). The status rollup is
+also mirrored in the pure core (`core::cut::roll_up_status` + `rank`) so
+the "derived, never stored" rule lives on both sides of the seam.
+`HelmView` is the surface #9 (New Workspace) and #12 (Zoom) build on;
+Session chips call an injected `onZoomSession` — a logging placeholder now,
+wired so #12 takes it over. **Mounting into the app shell is kept interim
+and minimal**: the existing `window.helmsmen` dev console (installed in
+`main.tsx` at task #4) grew `openHelm()` / `closeHelm()`, which mount the
+wall as a full-window overlay. Promoting the Helm to a real route / the
+default home view is a later upstream integration point, deliberately left
+for when the view switch (`esc`/`t`) and repo picker (#14) land.
+
+The status dots (task #11) added **no** shared-file edit and touch **no**
+upstream module. They ride Terax's in-tree OSC agent-signal as a read-only
+SOURCE and keep the derivation in Helmsmen modules:
+
+- Terax's `modules::pty::agent_detect` (untouched) already parses hostile PTY
+  bytes into a bounded set of signal kinds and emits them on the Tauri event
+  `terax:agent-signal`. Helmsmen only _reads_ that event; it never modifies
+  the parser or the emit site (`modules::pty::session`).
+- The signal -> event -> status seam is Helmsmen-owned and pure:
+  `modules::harness::agent_signal::ingest_agent_signal` (SOURCE adapter: kind
+  string -> `core::cut::SessionSignal`, hostile-input-defensive, size-capped)
+  -> `core::cut::session_status_from_signal` -> the existing
+  `core::cut::roll_up_status`. The frontend mirrors it in
+  `src/modules/helm/agentSignal.ts` and overlays the live status onto the
+  Session facts the view-model rollup already reads — no card change.
+- **M3 swap point**: the control plane's per-Workspace hooks replace the
+  SOURCE (they emit the same `SessionSignal` per Session), leaving the
+  pure-core reducer untouched. `agent-signal` then stays the Signal-only
+  fallback for Harnesses without the `control_plane_hooks` Cap. The one open
+  seam is correlation: the interim SOURCE keys signals by a whole-terminal
+  pty id, while the Helm wall keys Sessions by their runtime session id;
+  binding a signal to a specific Workspace Session is exactly what the M3
+  per-Workspace source pins down.
+
+The Zoom / "take the wheel" view (task #12) added **no** upstream Terax
+edit. It lives entirely in the new `src/modules/workspaces` module: pure,
+tested navigation logic (`keymap.ts` — key→action map, tab-index and
+`[`/`]` hop math; `zoomModel.ts` — Session→tab projection, zoom-target
+resolution, message-line) and the React shell over it (`Zoom.tsx`,
+`PtyPane.tsx`, `Quarterdeck.tsx`). The PTY pane reuses the helm module's
+safe rendering path (hostile bytes → `createStreamBuffer` → `textContent`
+only) and the backend runtime **unchanged**: attach-on-zoom is the existing
+`helm_attach_agent` (scrollback replays, then live), and `m`'s line-to-PTY
+is the existing `helm_write_agent` — both already pinned by the runtime
+conformance suite (`case_attach_replays_scrollback_then_streams`,
+`case_write_reaches_stdin`). The **only** helm-module edit was the
+container-level wiring the #10 seam left for it: `devConsole.ts`'s
+`openHelm()`/`closeHelm()` now mount the quarterdeck (wall + zoom) instead
+of the bare wall, and `spawnAgentView` registers each spawn in the interim
+`sessionStore` so a Workspace can be zoomed into before Session facts land
+on the wall. No status-dot / Session-facts render code (#11's) was touched.
+Promoting the zoom to a real app-shell route — and giving the wall a card
+cursor so `↵` zooms a *selected* card (it currently zooms the first
+zoomable Workspace) — is a later upstream integration point, left for when
+the view switch and wall keyboard-nav land.
+
+The control plane (task #15, M3 backend half) added **no** upstream Terax
+edit and **no** new crate. It lives in two new Helmsmen modules:
+
+- `modules::hooks` (imperative shell): a per-Workspace, loopback-only HTTP
+  endpoint (`server.rs`) with a per-session bearer token and a pure request
+  boundary (`wire.rs` — token check, size cap, typed parse; all unit-tested
+  with zero I/O). It is built on `std::net` blocking sockets **on purpose**:
+  no HTTP-server crate joins the tree, so `cargo-deny`'s Apache-2.0 license
+  gate and the upstream `hyper`/`tokio` stack are both left untouched. The
+  endpoint binds `127.0.0.1:0`; a process that discovers the port but not the
+  token can inject nothing (rejected `401`), and oversized bodies are capped
+  before parsing (`413`).
+- `modules::core::control_plane` (pure core): the event→transition reducer,
+  lifted from `spike-approval-loop/correlate.js` (verdict PASS). Same card
+  lifecycle (`Pending→Surfaced→Allowed→ClosedNoRun`), same strict
+  `tool_use_id` correlation, same "a permission `Notification` is status-only,
+  never sources a card" rule — with the spike's one residual ambiguity
+  removed: a permission prompt surfaces *every* pending card in the session
+  (no oldest-pending guess), so the captured multi-call corpus replays to
+  zero warnings (the criterion-4 pass signal). It keeps the pure-core purity
+  guard (`modules::registry::pure_core_has_no_io_imports`) green — no network,
+  async, or process imports.
+
+This is the **M3 replacement SOURCE** for the M2 agent-signal seam that
+task #11 left open: `control_plane::hook_event_signal` maps each event to the
+same `core::cut::SessionSignal`, feeding the unchanged
+`session_status_from_signal` + `roll_up_status` reducer. The two sources
+coexist during the M2→M3 swap. **Test seam 1** (synthetic hook events at the
+endpoint prove hook-POST→card render with no live agent) is realized by the
+corpus suites in both new modules. Deliberately **not** in this slice: the
+hook config written into the cut worktree (task #16 consumes
+`ControlPlaneEndpoint::{port, token, url}`), so `lib.rs` is untouched — the
+endpoint is per-Workspace, spawned by the cut pipeline, not an app-boot
+singleton.
 
 ## Local, non-committed state
 

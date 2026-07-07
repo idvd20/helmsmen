@@ -7,6 +7,11 @@ import ReactDOM from "react-dom/client";
 import App from "./app/App";
 import { initLaunchDir } from "./lib/launchDir";
 import { USE_CUSTOM_WINDOW_CONTROLS } from "./lib/platform";
+import { installHelmDevConsole } from "./modules/helm/devConsole";
+
+// Helmsmen dev console (M1): `window.helmsmen` — add/detect/list Projects
+// (HELMSMEN integration point — see docs/fork-posture.md).
+installHelmDevConsole();
 
 if (USE_CUSTOM_WINDOW_CONTROLS) {
   document.documentElement.dataset.chrome = "borderless";
